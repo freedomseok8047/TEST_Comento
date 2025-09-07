@@ -64,8 +64,8 @@ all: main-build
 main-build: RTOS_DTC_Comento.elf secondary-outputs
 
 # Tool invocations
-RTOS_DTC_Comento.elf RTOS_DTC_Comento.map: $(OBJS) $(USER_OBJS) C:\Users\T-user\STM32CubeIDE\workspace_1.18.1\TEST_Comento\RTOS_DTC_Comento\STM32F413ZHTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "RTOS_DTC_Comento.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\T-user\STM32CubeIDE\workspace_1.18.1\TEST_Comento\RTOS_DTC_Comento\STM32F413ZHTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="RTOS_DTC_Comento.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+RTOS_DTC_Comento.elf RTOS_DTC_Comento.map: $(OBJS) $(USER_OBJS) C:\Users\T-user\STM32CubeIDE\workspace_1.19.0\TEST_Comento\RTOS_DTC_Comento\STM32F413ZHTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "RTOS_DTC_Comento.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\T-user\STM32CubeIDE\workspace_1.19.0\TEST_Comento\RTOS_DTC_Comento\STM32F413ZHTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="RTOS_DTC_Comento.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
