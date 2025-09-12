@@ -4,6 +4,7 @@
 #include <string.h> 
 #include "stm32f4xx_hal.h"
 #include "mp5457gu.h"
+#include "25lc256.h" 
 
 // ========== PMIC 설정 상수 ==========
 #define MP5475_I2C_ADDRESS          0x60
@@ -23,6 +24,16 @@ typedef enum {
 	I2C_STATE_RX_COMPLETE,
 	I2C_STATE_ERROR
 } i2c_state_t;
+
+// ========== EEPROM 상태 머신 ==========
+typedef enum {
+  EEPROM_STATE_IDLE = 0,
+  EEPROM_STATE_WRITE_ENABLE,
+  EEPROM_STATE_WRITING,
+  EEPROM_STATE_READ_STATUS,
+  EEPROM_STATE_COMPLETE,
+  EEPROM_STATE_ERROR
+} eeprom_state_t;
 
  // ========== PMIC 레지스터 주소 정의 ==========
  typedef enum {
@@ -44,7 +55,7 @@ typedef enum {
 } brake_dtc_code_t;
 
 // --- DTC 데이터 구조 정의 ---
-#pragma pack(push, 1)  // 기존:56 Byte × 6 = 336 최적화: 53 Byte × 6 = 318 절약: 18 Byte (5% 절약) 
+#pragma pack(push, 1)  // 기존:56 Byte × 6 = 336 최적화: 53 Byte × 6 = 318 
 typedef struct {
 	uint16_t DTC_Code;              // 고장 코드 (예: C1234)
 	char Description[50];           // 설명 문자열
@@ -56,10 +67,40 @@ DTC_Table_t DTC_Table = { 0x1234, "Brake UV Fault", 0 };
 
  // ========== I2C 상태 관리 변수 ==========
 volatile i2c_state_t i2c_state = I2C_STATE_IDLE;  // 현재 I2C 작업 상태
-uint8_t current_reg_index = 0;                // 레지스터 배열 인덱스 (0부터 시작)
-uint8_t pmic_reg_address = 0;                 // 현재 처리 중인 레지스터 주소
-uint8_t pmic_reg_data = 0;                    // DMA로 읽은 데이터 저장용
-uint8_t i2c_rx_buffer[1] = {0};               // DMA 수신 버퍼 (1바이트씩 읽으므로 크기 1)
+uint8_t current_reg_index = 0;              // 레지스터 배열 인덱스 (0부터 시작)
+uint8_t pmic_reg_address = 0;               // 현재 처리 중인 레지스터 주소
+uint8_t pmic_reg_data = 0;                  // DMA로 읽은 데이터 저장용
+uint8_t i2c_rx_buffer[1] = {0};             // DMA 수신 버퍼 (1바이트씩 읽음음 크기 1)
+
+// ========== EEPROM 상태 관리 변수 ==========
+volatile eeprom_state_t eeprom_state = EEPROM_STATE_IDLE;
+static volatile bool eeprom_dma_busy = false;
+static volatile bool eeprom_write_in_progress = false;
+static uint8_t current_dtc_save_index = 0;
+
+// EEPROM DMA 버퍼
+static uint8_t eeprom_tx_buffer[67] __attribute__((aligned(4)));  // CMD(1) + ADDR(2) + DATA(64)
+static uint8_t eeprom_rx_buffer[67] __attribute__((aligned(4)));
+static uint16_t current_eeprom_address = LC256_AREA_DTC_CURRENT;
+static uint16_t dtc_log_count = 0;
+static bool eeprom_is_init_mode = false;
+
+// EEPROM용 DTC 로그 구조체 (64바이트)
+typedef struct {
+    uint32_t timestamp;
+    uint16_t DTC_Code;
+    char Description[48];
+    uint8_t active;
+    uint8_t occurrence_count;
+    uint8_t status;
+    uint8_t reserved[9];
+} __attribute__((packed)) eeprom_dtc_log_t;
+
+static eeprom_dtc_log_t current_dtc_log;
+
+// GPIO 핀 정의 (EEPROM CS 추가)
+#define EEPROM_CS_PORT    GPIOB
+#define EEPROM_CS_PIN     GPIO_PIN_4
 
 // 읽을 레지스터 주소 배열 (순서대로 처리)
 static const mp5475_register_t reg_addresses[] = {
@@ -93,6 +134,18 @@ static void add_dtc_code(uint16_t dtc_code);
 static void print_dtc_summary(void);
 static void reset_pmic_diagnosis(void);
 
+/* ========== EEPROM 함수 프로토타입 ========== */
+static void eeprom_cs_select(void);
+static void eeprom_cs_deselect(void);
+static HAL_StatusTypeDef eeprom_write_enable(void);
+static HAL_StatusTypeDef eeprom_wip_check(void);
+static HAL_StatusTypeDef eeprom_write_dtc_log(uint16_t address, eeprom_dtc_log_t* dtc_log);
+static bool eeprom_is_write_complete(void);
+static void save_dtc_to_eeprom(void);
+static void convert_dtc_to_log(DTC_Table_t* dtc, eeprom_dtc_log_t* log);
+static uint16_t get_next_eeprom_address(void);
+static HAL_StatusTypeDef eeprom_init(void);
+
 // Init 프로토 타입 선언
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -104,6 +157,249 @@ static void MX_I2C2_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_UART4_Init(void);
+
+/*
+1. save_dtc_to_eeprom() 호출 ↓ 
+2. eeprom_write_enable() 호출 ↓ 
+3. HAL_SPI_TxCpltCallback() → Write Enable 완료 감지 ↓
+4. eeprom_write_dtc_log() 호출 (실제 데이터 쓰기) ↓
+5. HAL_SPI_TxCpltCallback() → Page Write 완료 감지↓
+6. eeprom_wip_check() 호출 ↓ 
+7. HAL_SPI_TxRxCpltCallback() → Status 읽기 완료 ↓
+8. WIP 비트 확인 → 완료되면 다음 DTC 또는 종료
+*/
+
+// ========== EEPROM CS 핀 제어 함수 ==========
+static void eeprom_cs_select(void)
+{
+    HAL_GPIO_WritePin(EEPROM_CS_PORT, EEPROM_CS_PIN, GPIO_PIN_RESET);
+}
+
+static void eeprom_cs_deselect(void)
+{
+  HAL_GPIO_WritePin(EEPROM_CS_PORT, EEPROM_CS_PIN, GPIO_PIN_SET);
+}
+
+//========== EEPROM Write Enable 함수 ==========
+/*
+Role: 25LC256 EEPROM에 "이제 데이터를 쓸 준비를 해라"
+why?
+EEPROM은 데이터 보호를 위해 기본적으로 쓰기가 금지되어 있음
+쓰기 전에 반드시 Write Enable 명령(0x06)을 보내야 함
+데이터시트에서 요구하는 필수 절차
+when?
+DTC를 EEPROM에 저장하기 직전
+save_dtc_to_eeprom() 함수에서 첫 번째로 호출
+what?
+DMA가 사용 중인지 확인
+Write Enable 명령(0x06)을 송신 버퍼에 준비
+CS 핀을 LOW로 설정 (EEPROM 선택)
+DMA로 1바이트 전송 시작
+완료는 HAL_SPI_TxCpltCallback()에서 처리
+*/
+static HAL_StatusTypeDef eeprom_write_enable(void)
+{
+    if(eeprom_dma_busy) {
+        return HAL_BUSY;
+    }
+
+    printf("[EEPROM] Sending Write Enable command (0X06)\n");
+    
+    eeprom_dma_busy = true;
+    eeprom_tx_buffer[0] = LC256_CMD_WREN;
+    
+    eeprom_cs_select();
+    eeprom_state = EEPROM_STATE_WRITE_ENABLE;
+    //hspi: SPI 핸들 포인터 pData: 송신할 데이터 버퍼 Size: 송신할 바이트 수
+    HAL_StatusTypeDef status = HAL_SPI_Transmit_DMA(&hspi1, eeprom_tx_buffer, 1); 
+                              // -> HAL_SPI_TxCpltCallback
+
+    if(status != HAL_OK){
+        printf("[EEPROM] ERROR: Write Enable failed\n");
+        eeprom_cs_deselect();
+        eeprom_state = EEPROM_STATE_ERROR;
+        eeprom_dma_busy = false;
+    }
+    return status;
+}
+
+//========== EEPROM CHECK WIP 읽기 함수 ==========
+/*
+Role : "쓰기 완료됐나 확인" [WIP 비트 체크]
+why?
+EEPROM은 데이터 쓰기에 최대 5ms가 소요됨
+쓰기 중에는 다른 명령을 받을 수 없음
+WIP(Write In Progress) 비트를 확인해서 완료 여부 판단
+when?
+Page Write 완료 후 -> HAL_SPI_TxCpltCallback()에서 WRITING 상태일 때 호출
+what?
+DMA가 사용 중인지 확인
+Status Read 명령(0x05) + 더미바이트를 준비
+CS 핀을 LOW로 설정
+DMA로 2바이트 송수신 시작
+완료는 HAL_SPI_TxRxCpltCallback()에서 처리
+*/
+static HAL_StatusTypeDef eeprom_wip_check(void)
+{
+    if(eeprom_dma_busy){
+      return HAL_BUSY;
+    }
+    printf("[EEPROM] Reading status register\n");
+
+    eeprom_dma_busy = true;
+    eeprom_tx_buffer[0] = LC256_CMD_RDSR;
+    eeprom_tx_buffer[1] = 0x00;
+
+    eeprom_cs_select();
+    eeprom_state = EEPROM_STATE_READ_STATUS;
+    /*
+    hspi: SPI 핸들 포인터 (&hspi1)
+    pTxData: 송신할 데이터 버퍼 (eeprom_tx_buffer)
+    pRxData: 수신된 데이터 저장 버퍼 (eeprom_rx_buffer)
+    Size: 송수신할 바이트 수 (2)*/
+    HAL_StatusTypeDef status = HAL_SPI_TransmitReceive_DMA(&hspi1,
+                                                            eeprom_tx_buffer,
+                                                            eeprom_rx_buffer,
+                                                            2); // -> HAL_SPI_TxRxCpltCallback()
+
+    if(status != HAL_OK){
+        printf("[EEPROM] ERROR: Status read failed\n");
+        eeprom_cs_deselect();
+        eeprom_state = EEPROM_STATE_ERROR;
+        eeprom_dma_busy = false;
+    }
+
+    return status;
+}
+
+// ========== Write 완료 확인 함수 ==========
+static bool eeprom_is_write_complete(void)
+{
+    return !(eeprom_rx_buffer[1] & 0x01); 
+    // WIP = 1: 쓰기 진행 중 (Write In Progress)
+    // WIP = 0: 쓰기 완료됨 (Write Complete)
+}
+
+// ========== DTC 로그 변환 함수 ==========
+static void convert_dtc_to_log(DTC_Table_t* dtc, eeprom_dtc_log_t* log)
+{
+  /*
+    매개변수:
+    ptr: 채울 메모리 블록의 시작 주소
+    value: 채울 값 (0~255)
+    num: 채울 바이트 수
+
+    log: eeprom_dtc_log_t 구조체 주소소
+    0: 0x00 값으로 채움
+    sizeof(eeprom_dtc_log_t): 구조체 크기만큼 (64바이트)
+
+    결과:
+    구조체의 모든 바이트를 0으로 초기화
+    64바이트 모두 0x00으로 설정됨
+
+    왜 사용하나:
+    구조체 초기화 (쓰레기 값 제거)
+    패딩 바이트까지 모두 0으로 설정
+    안전한 초기 상태 보장
+  */
+  // eeprom_dtc_log_t 구조체 초기화
+  memset(log, 0, sizeof(eeprom_dtc_log_t));
+
+  log->timestamp = HAL_GetTick();
+  log->DTC_Code = dtc->DTC_Code;
+  strncpy(log->Description, dtc->Description, 47); 
+  //47의미: Description 필드의 크기 -1
+  log->active = dtc->active;
+  log->occurrence_count = 1;
+  log->status = 0x01;
+}
+
+// ========== EEPROM DTC 쓰기 함수 ==========
+static HAL_StatusTypeDef eeprom_write_dtc_log(uint16_t address, eeprom_dtc_log_t* dtc_log)
+{
+    if(eeprom_dma_busy){
+        return HAL_BUSY;
+    }
+
+    printf("[EEPROM] Writing DTC log to address 0x%04X\n", address);
+
+    eeprom_dma_busy = true;
+    eeprom_write_in_progress = true;
+
+    eeprom_tx_buffer[0] = LC256_CMD_WRITE; // CMD 명령 : 바이트
+    eeprom_tx_buffer[1] = (address >> 8) & 0x7F; 
+    //25LC256은 15비트 주소 사용 (0x0000~0x7FFF)
+    // address >> 8 
+    // 0x7F = 127 = 0111 1111 address 상위 9비트 중 맨 앞비트 제외 
+    eeprom_tx_buffer[2] = address & 0xFF; // address 하우 8비트 [1],[2] 합쳐서 15비트 주소
+    
+    //Memory Copy : memcpy(목적지, 소스, 복사할_바이트_수);
+    memcpy(&eeprom_tx_buffer[3], dtc_log, sizeof(eeprom_dtc_log_t));
+
+    eeprom_cs_select();
+    eeprom_state = EEPROM_STATE_WRITING;
+
+    HAL_StatusTypeDef status = HAL_SPI_Transmit_DMA(&hspi1,
+                                                    eeprom_tx_buffer,
+                                                    3 + sizeof(eeprom_dtc_log_t)); 
+                                                    // -> HAL_SPI_TxCpltCallback()
+    
+    if (status != HAL_OK){
+        printf("[EEPROM] ERROR: DTC write failed\n");
+        eeprom_cs_deselect();
+        eeprom_state = EEPROM_STATE_ERROR;
+        eeprom_dma_busy = false;
+        eeprom_write_in_progress = false;
+    }
+  
+    return status;
+}
+
+// ========== 다음 주소 계산 함수 ==========
+/*
+"지속적으로 DTC를 저장"
+"메모리 부족으로 저장 중단 X"
+"가장 최근 64개 DTC를 유지"
+*/
+static uint16_t get_next_eeprom_address(void)
+{
+    uint16_t next_addr = LC256_AREA_DTC_CURRENT + (dtc_log_count * sizeof(eeprom_dtc_log_t));
+
+    //DTC를 저장할 위치가 LC256_AREA_DTC_HISTORY 넘으면 다시 0x0000부터 저장 시작 (덮어쓰기)
+    if(next_addr + sizeof(eeprom_dtc_log_t) >= LC256_AREA_DTC_HISTORY)
+    {
+        next_addr = LC256_AREA_DTC_CURRENT;
+        dtc_log_count = 0;
+    }
+
+    return next_addr;
+}
+
+// ========== DTC EEPROM 저장 시작 함수 (추가) ==========
+static void save_dtc_to_eeprom(void)
+{
+    if(dtc_count == 0){
+        printf("[EEPROM] NO DTCs to save\n");
+        return;
+    }
+
+    if (eeprom_state != EEPROM_STATE_IDLE){
+      printf("[EEPROM] EEPROM busy, cannot save DTCs\n");
+      return;
+    }
+
+    printf("[EEPROM] Starting DTC save process (%d DTCs)\n", dtc_count);
+
+    current_dtc_save_index = 0 ;
+    current_eeprom_address = get_next_eeprom_address();
+
+    convert_dtc_to_log(&detected_dtc_table[current_dtc_save_index], &current_dtc_log);
+
+    if(eeprom_write_enable() != HAL_OK){
+        printf("[EEPROM] ERROR: Failed to start DTC save\n");
+        eeprom_state = EEPROM_STATE_ERROR;
+    }
+}
 
 // PMIC IRQ 발생 시 호출되는 콜백
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
@@ -145,6 +441,11 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
                   uint16_t MemAddSize,
                   uint8_t *pData,
                   uint16_t Size); */
+    /* (MP5475_I2C_ADDRESS << 1)
+    I2C 프로토콜 : 주소 7비트 + R/W 비트 1비트 = 총 8비트 전송.
+    HAL 라이브러리가 R/W 비트를 자동으로 추가하므로,
+    사용자는 7비트 주소를 1비트 왼쪽으로 시프트하여 공간을 만들어줘야 함함.
+    */
     HAL_StatusTypeDef status = HAL_I2C_Mem_Read_DMA(&hi2c1,
                                                     (MP5475_I2C_ADDRESS << 1),
                                                     reg_addr,
@@ -211,6 +512,108 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
 		// 통신 에러 DTC 추가 
 		add_dtc_code(DTC_BRAKE_COMM_ERROR);
 	}
+}
+
+// ========== SPI DMA 송신 완료 콜백 ==========
+/*
+  eeprom_write_enable() 내부 HAL_SPI_Transmit_DMA()의 완료 콜백 
+  if (EEPROM_STATE_WRITE_ENABLE) : 데이터 쓸 준비 완
+  if (EEPROM_STATE_WRITING) : 데이터 쓰는 시간 5ms 대기 , 데이터 쓰기 완 
+*/
+void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    if(hspi -> Instance == SPI1){
+
+        eeprom_cs_deselect();
+        eeprom_dma_busy = false;
+
+        switch (eeprom_state) {
+            case EEPROM_STATE_WRITE_ENABLE:
+                printf("[EEPROM] Write ENable completed\n");
+                HAL_Delay(1);
+
+                if (eeprom_write_dtc_log(current_eeprom_address, &current_dtc_log) != HAL_OK)
+                {
+                  eeprom_state = EEPROM_STATE_ERROR;
+                }
+                break;
+            
+            case EEPROM_STATE_WRITING:
+                printf("[EEPROM] DTC write completed, cecking status\n");
+                HAL_Delay(LC256_WRITE_CYCLE_TIME);
+
+                if(eeprom_wip_check() != HAL_OK) {
+                    eeprom_state = EEPROM_STATE_ERROR;
+                }
+                break;
+
+            default:
+                break;
+        }
+    }
+}
+
+// ========== SPI DMA 송수신 완료 콜백 ==========
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    if(hspi->Instance == SPI1){
+        eeprom_cs_deselect();
+        eeprom_dma_busy = false;
+
+        // 콜백에서 구분
+        if (eeprom_is_init_mode) {
+        // 초기화 모드: 단순히 상태만 확인
+        printf("[EEPROM] Init status check: 0x%02X\n", eeprom_rx_buffer[1]);
+        eeprom_is_init_mode = false;
+        return;
+        }
+
+        if(eeprom_state == EEPROM_STATE_READ_STATUS){
+            printf("[EEPROM] Status: 0x%02X\n", eeprom_rx_buffer[1]);
+            
+            if (eeprom_is_write_complete()) {
+                printf("[EEPROM] Write completed successfully\n");
+
+                dtc_log_count++;
+                current_dtc_save_index++;
+
+                if(current_dtc_save_index < dtc_count) {
+                    printf("[EEPROM] Processing next DTC (%d/%d)\n", current_dtc_save_index + 1, dtc_count);
+
+                    current_eeprom_address = get_next_eeprom_address();
+                    convert_dtc_to_log(&detected_dtc_table[current_dtc_save_index], &current_dtc_log);
+
+                    if(eeprom_write_enable() != HAL_OK) {
+                        eeprom_state = EEPROM_STATE_ERROR;
+                    }
+                } else {
+                    printf("[EEPROM] All DTCs saved successfully\n");
+                    eeprom_state = EEPROM_STATE_COMPLETE;
+                    eeprom_write_in_progress = false;
+                }
+            } else {
+                printf("[EEPROM] Write in progress, checking again...\n");
+                HAL_Delay(1);
+                if (eeprom_wip_check() != HAL_OK) {
+                    eeprom_state = EEPROM_STATE_ERROR;
+                }
+            }
+        }
+    }
+}
+
+// ========== SPI 에러 콜백 ==========
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+    if(hspi->Instance == SPI1) {
+        uint32_t error_code = HAL_SPI_GetError(hspi);
+        printf("[EEPROM] ERROR: SPI failed (Error: 0x%08lx)\n",error_code);
+
+        eeprom_cs_deselect();
+        eeprom_state = EEPROM_STATE_ERROR;
+        eeprom_dma_busy = false;
+        eeprom_write_in_progress = false;
+    }
 }
 /*
 0x01 = 00000001  // 비트 0 체크
@@ -358,6 +761,10 @@ static void print_dtc_summary(void){
               detected_dtc_table[i].DTC_Code,
               detected_dtc_table[i].Description);
       }
+
+      // EEPROM에 DTC 저장 시작
+      printf("\n[EEPROM] === Starting DTC save to EEPROM ===\n");
+      save_dtc_to_eeprom();
   }
   printf("===================================\n\n");
 }
@@ -380,6 +787,12 @@ void system_init(void)
 	  MX_SPI1_Init();
 	  MX_SPI2_Init();
 	  MX_UART4_Init();
+
+    // EEPROM 초기화 추가
+    if (eeprom_init() != HAL_OK) {
+      printf("[INIT] ERROR: EEPROM initialization failed!\n");
+      Error_Handler();
+    }
 
 	printf("[INIT] System initialization completed!...\n");
 }
@@ -426,7 +839,7 @@ void system_init(void)
 // 			default:
 //             printf("[I2C] Unknown state: %d\n", i2c_state);
 //             i2c_state = I2C_STATE_IDLE;  // 안전한 상태로 복귀
-//             break;
+//             break;`
 // 	}
 // }
 
@@ -864,7 +1277,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOG_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_4, GPIO_PIN_SET);    
 
   /*Configure GPIO pins : PB0 PB1 */
   GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
@@ -886,9 +1299,70 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLUP;           // 내부 풀업
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
+  // EEPROM CS 핀 설정 (추가)
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
   // NVIC 인터럽트 활성화
   HAL_NVIC_SetPriority(EXTI3_IRQn, 2, 0);
   HAL_NVIC_EnableIRQ(EXTI3_IRQn);
+}
+
+// ========== EEPROM 초기화 함수 ==========
+static HAL_StatusTypeDef eeprom_init(void)
+{
+    printf("[EEPROM] Initializing 25LC256...\n");
+      
+    // 1단계: 기본 설정
+    eeprom_is_init_mode = true;
+    eeprom_cs_deselect();
+    eeprom_state = EEPROM_STATE_IDLE;
+    eeprom_dma_busy = false;
+    eeprom_write_in_progress = false;
+    dtc_log_count = 0;
+    current_eeprom_address = LC256_AREA_DTC_CURRENT;
+    
+    memset(eeprom_tx_buffer, 0, sizeof(eeprom_tx_buffer));
+    memset(eeprom_rx_buffer, 0, sizeof(eeprom_rx_buffer));
+    
+    HAL_Delay(10);
+    
+    // 2단계: EEPROM 연결 확인 (Status Register 읽기)
+    printf("[EEPROM] Checking EEPROM connection...\n");
+    
+    if (eeprom_wip_check() != HAL_OK) {
+        printf("[EEPROM] ERROR: Status read failed - Communication error\n");
+        return HAL_ERROR;
+    }
+    
+    // 3단계: DMA 완료 대기
+    uint32_t timeout = HAL_GetTick() + 100;  // 100ms 타임아웃
+    while (eeprom_dma_busy && (HAL_GetTick() < timeout)) {
+        HAL_Delay(1);
+    }
+    
+    // 4단계: 결과 확인
+    if (HAL_GetTick() >= timeout) {
+        printf("[EEPROM] ERROR: Status read timeout\n");
+        eeprom_state = EEPROM_STATE_IDLE;
+        eeprom_dma_busy = false;
+        return HAL_ERROR;
+    }
+    
+    if (eeprom_state == EEPROM_STATE_ERROR) {
+        printf("[EEPROM] ERROR: Communication failed\n");
+        eeprom_state = EEPROM_STATE_IDLE;
+        return HAL_ERROR;
+    }
+    
+    // 5단계: 성공
+    printf("[EEPROM] 25LC256 initialized successfully\n");
+    printf("[EEPROM] Status Register: 0x%02X\n", eeprom_rx_buffer[1]);
+    
+    return HAL_OK;
 }
 
 /**
