@@ -13,11 +13,15 @@
 #include <stdio.h>
 
 //=============================================================================
-// 외부 변수 및 전역 변수
+// 전역 변수
 //=============================================================================
 extern CAN_HandleTypeDef hcan1;
 static bool can_initialized = false;
 static can_status_t can_status = {0};
+
+//=============================================================================
+// TJA1051 트랜시버 제어 함수들 (통합)
+//=============================================================================
 
 /**
  * @brief TJA1051 트랜시버 초기화
@@ -34,7 +38,8 @@ static bool tja1051_init(void)
     
     // 기본적으로 Normal 모드로 설정
     HAL_GPIO_WritePin(TJA1051_S_PORT, TJA1051_S_PIN, GPIO_PIN_RESET);
-
+    
+    printf("[TJA1051] 트랜시버 초기화 완료\n");
     return true;
 }
 
@@ -45,18 +50,20 @@ static bool tja1051_set_mode(tja1051_mode_t mode)
 {
     switch(mode) {
         case TJA1051_MODE_NORMAL:
-            // S = LOW : Normal mode (송수신 가능)
-            HAL_GPIO_WritePin(TJA1051_S_PORT,TJA1051_S_PIN,GPIO_PIN_RESET);
+            // S = LOW: Normal mode (송수신 가능)
+            HAL_GPIO_WritePin(TJA1051_S_PORT, TJA1051_S_PIN, GPIO_PIN_RESET);
             printf("[TJA1051] Normal 모드 설정\n");
             break;
-        
+            
         case TJA1051_MODE_SILENT:
-            // S = HIGH : Silent mode (수신만 가능)
-            HAL_GPIO_WritePin(TJA1051_S_PORT,TJA1051_S_PIN,GPIO_PIN_SET);
+            // S = HIGH: Silent mode (수신만 가능)
+            HAL_GPIO_WritePin(TJA1051_S_PORT, TJA1051_S_PIN, GPIO_PIN_SET);
             printf("[TJA1051] Silent 모드 설정\n");
             break;
-        
+            
         case TJA1051_MODE_OFF:
+            // TJA1051T 버전은 OFF 모드 없음 (항상 동작)
+            printf("[TJA1051] OFF 모드는 지원되지 않음\n");
             return false;
     }
     return true;
@@ -68,11 +75,12 @@ static bool tja1051_set_mode(tja1051_mode_t mode)
 bool can_service_init(can_speed_t speed)
 {
     printf("[CAN] CAN Service 초기화\n");
-
-    if (!tja1051_init(TJA1051_TYPE_T) || !tja1051_set_mode(TJA1051_MODE_NORMAL)){
+    
+    // TJA1051 트랜시버 초기화 및 Normal 모드 설정
+    if (!tja1051_init() || !tja1051_set_mode(TJA1051_MODE_NORMAL)) {
         return false;
     }
-
+    
     // CAN 필터 설정 (브레이크 시스템 + UDS 진단)
     CAN_FilterTypeDef filter;
     filter.FilterIdHigh = (0x200 << 5);
@@ -84,15 +92,16 @@ bool can_service_init(can_speed_t speed)
     filter.FilterActivation = ENABLE;
     filter.SlaveStartFilterBank = 14;
     HAL_CAN_ConfigFilter(&hcan1, &filter);
-
+    
+    // CAN 시작 및 인터럽트 활성화
     if (HAL_CAN_Start(&hcan1) != HAL_OK) return false;
-    if (HAL_CAN_ActivateNotifivation(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING))
-
+    if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) return false;
+    
     // UDS 초기화
     uds_protocol_init();
-
+    
     can_initialized = true;
-    printf("[CAN] CAN Service 초기화 완료\n")
+    printf("[CAN] CAN Service 초기화 완료\n");
     return true;
 }
 
@@ -101,26 +110,26 @@ bool can_service_init(can_speed_t speed)
 //=============================================================================
 bool can_service_transmit(const can_frame_t *frame)
 {
-    if(!can_initialized || !frame) return false;
-
+    if (!can_initialized || !frame) return false;
+    
     CAN_TxHeaderTypeDef tx_header;
     uint32_t tx_mailbox;
-
+    
     tx_header.StdId = frame->id;
-    tx_header.RTR = frame-> rtr ? CAN_RTR_REMOTE : CAN_RTR_DATA;
+    tx_header.RTR = frame->rtr ? CAN_RTR_REMOTE : CAN_RTR_DATA;
     tx_header.IDE = CAN_ID_STD;
     tx_header.DLC = (frame->dlc > 8) ? 8 : frame->dlc;
-    tx_header.transmitGlobalTime = DISABLE;
-
-    HAL_StatusTypeDef result = HAL_CAN_AddTxMessage(&hcan1, &tx_header, (uint8_t*)frame->data, &tx_mailbox);
-
-    if (result = HAL_OK){
+    tx_header.TransmitGlobalTime = DISABLE;
+    
+    HAL_StatusTypeDef result = HAL_CAN_AddTxMessage(&hcan1, &tx_header, 
+                                                    (uint8_t*)frame->data, &tx_mailbox);
+    
+    if (result == HAL_OK) {
         can_status.total_tx_count++;
         return true;
     }
     return false;
 }
-
 
 //=============================================================================
 // DTC 브로드캐스트 (핵심 기능)
@@ -154,51 +163,52 @@ bool can_service_broadcast_dtc_event(uint16_t dtc_code, uint8_t status)
 bool can_service_send_brake_status(const brake_can_data_t *status_data)
 {
     can_frame_t frame;
-    frame.id = CAN_ID_BRAKE_STATUS;  // 0x200
+    frame.id = CAN_ID_BRAKE_STATUS;     // 0x200
     frame.dlc = 8;
     frame.rtr = false;
-
-    memcpy(frame.data, status_data -> raw_data, 8);
+    
+    memcpy(frame.data, status_data->raw_data, 8);
     return can_service_transmit(&frame);
 }
 
+//=============================================================================
 // CAN 수신 인터럽트 콜백
-void HAL_CAN_FxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+//=============================================================================
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
     CAN_RxHeaderTypeDef rx_header;
     uint8_t rx_data[8];
-
-    HAL_CAN_GetRxMessage(&hcan1,CAN_RX_FIFO0, &rx_header, rx_data);
-
+    
+    HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &rx_header, rx_data);
+    
     can_frame_t rx_frame;
     rx_frame.id = rx_header.StdId;
     rx_frame.dlc = rx_header.DLC;
-    rx_frame.rtr = (rx_header.RTR = CAN_RTR_REMOTE);
+    rx_frame.rtr = (rx_header.RTR == CAN_RTR_REMOTE);
     memcpy(rx_frame.data, rx_data, 8);
-
+    
     // UDS 진단 요청 처리
-    if(rx_frame.id = CAN_ID_UDS_REQUEST) {
+    if (rx_frame.id == CAN_ID_UDS_REQUEST) {
         can_service_handle_uds_request(&rx_frame);
     }
-
+    
     can_status.total_rx_count++;
 }
-
 
 //=============================================================================
 // UDS 요청 처리 (Single Frame만)
 //=============================================================================
 bool can_service_handle_uds_request(const can_frame_t *frame)
 {
-    if(frame->dlc < 2) return false;
-
-    uint8_t pci = frame -> data[0];
-    uint8_t pci_type = (pci >> 4) 0x0F;
-    uint9_t data_len = pci & 0x0F;
-
-    if(PCI_type != 0) return false;
-
-    //UDS 처리 
+    if (frame->dlc < 2) return false;
+    
+    uint8_t pci = frame->data[0];
+    uint8_t pci_type = (pci >> 4) & 0x0F;
+    uint8_t data_len = pci & 0x0F;
+    
+    if (pci_type != 0) return false;  // Single Frame만 지원
+    
+    // UDS 처리
     uds_request_t uds_req;
     if (uds_parse_can_message(&frame->data[1], data_len, &uds_req)) {
         uds_response_t uds_resp;
@@ -215,26 +225,27 @@ bool can_service_handle_uds_request(const can_frame_t *frame)
 static bool can_service_send_uds_response(const uds_response_t *response)
 {
     can_frame_t resp_frame;
-    resp_frame.id = CAN_ID_UDS_RESPONSE;
+    resp_frame.id = CAN_ID_UDS_RESPONSE;  // 0x7E8
     resp_frame.dlc = 8;
     resp_frame.rtr = false;
-
-    memset(resp_frame.data, 0 ,8);
-
-    if (response -> is_negative) {
+    
+    memset(resp_frame.data, 0, 8);
+    
+    if (response->is_negative) {
         resp_frame.data[0] = 0x03;
         resp_frame.data[1] = 0x7F;
-        resp_frame.data[2] = response -> service_id;
-        resp_frame.data[3] = response -> nrc; 
+        resp_frame.data[2] = response->service_id;
+        resp_frame.data[3] = response->nrc;
     } else {
-        uint8_t total_len = 1 + response -> data_length;
-        if(total_len > 7) total_len = 7;
-
+        uint8_t total_len = 1 + response->data_length;
+        if (total_len > 7) total_len = 7;
+        
         resp_frame.data[0] = total_len;
-        resp_frame.data[1] = response-> service_id;
-        memcpy(&resp_frame.date[2], response-> data, (response-> data_length > 6) ? 6 : response -> data_length);    
+        resp_frame.data[1] = response->service_id;
+        memcpy(&resp_frame.data[2], response->data, 
+               (response->data_length > 6) ? 6 : response->data_length);
     }
-
+    
     return can_service_transmit(&resp_frame);
 }
 
@@ -250,9 +261,9 @@ bool can_service_get_status(can_status_t *status)
 
 bool can_service_deinit(void)
 {
-    HAL_CAN_DeactivateNotifivation(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+    HAL_CAN_DeactivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
     HAL_CAN_Stop(&hcan1);
-    tja1051_set_mode(TJA1051_MODE_OFF);
+    tja1051_set_mode(TJA1051_MODE_SILENT);  // Silent 모드로 전환
     can_initialized = false;
     return true;
 }
