@@ -194,12 +194,6 @@ bool pmic_service_is_power_good(const pmic_status_data_t *status_data);
 uint8_t pmic_service_analyze_faults(const pmic_status_data_t *status_data);
 
 /**
- * @brief 개별 레지스터 값 출력 (디버깅용)
- * @param status_data PMIC 상태 데이터
- */
-void pmic_service_print_registers(const pmic_status_data_t *status_data);
-
-/**
  * @brief PMIC 상태 리셋
  */
 void pmic_service_reset_state(void);

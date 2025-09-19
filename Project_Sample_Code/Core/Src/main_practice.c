@@ -9,6 +9,7 @@
 #include "pmic_service.h"
 #include "uds_protocol.h"
 #include "eeprom_service.h"
+#include "cna_service.h"
 
 // ========== PMIC 설정 상수 ==========
 // #define MP5475_I2C_ADDRESS          0x60
@@ -59,15 +60,15 @@ extern UART_HandleTypeDef huart4;
 // } brake_dtc_code_t;
 
 // --- DTC 데이터 구조 정의 ---
-#pragma pack(push, 1)  // 기존:56 Byte × 6 = 336 최적화: 53 Byte × 6 = 318 
-typedef struct {
-	uint16_t DTC_Code;              // 고장 코드 (예: C1234)
-	char Description[50];           // 설명 문자열
-	uint8_t active;                 // 활성화 상태 플래그
-  } DTC_Table_t;
-#pragma pack(pop) 
+// #pragma pack(push, 1)  // 기존:56 Byte × 6 = 336 최적화: 53 Byte × 6 = 318 
+// typedef struct {
+// 	uint16_t DTC_Code;              // 고장 코드 (예: C1234)
+// 	char Description[50];           // 설명 문자열
+// 	uint8_t active;                 // 활성화 상태 플래그
+//   } DTC_Table_t;
+// #pragma pack(pop) 
 
-DTC_Table_t DTC_Table = { 0x1234, "Brake UV Fault", 0 };
+// DTC_Table_t DTC_Table = { 0x1234, "Brake UV Fault", 0 };
 
  // ========== I2C 상태 관리 변수 ==========
 // volatile i2c_state_t i2c_state = I2C_STATE_IDLE;  // 현재 I2C 작업 상태
@@ -100,7 +101,7 @@ DTC_Table_t DTC_Table = { 0x1234, "Brake UV Fault", 0 };
 //     uint8_t reserved[9];
 // } __attribute__((packed)) eeprom_dtc_log_t;
 
-static eeprom_dtc_log_t current_dtc_log;
+// static eeprom_dtc_log_t current_dtc_log;
 
 // GPIO 핀 정의 (EEPROM CS 추가)
 // #define EEPROM_CS_PORT    GPIOB
@@ -118,14 +119,14 @@ static eeprom_dtc_log_t current_dtc_log;
 // static uint8_t pmic_status_data[4];
 
  // ========== DTC 마스터 테이블 ==========
-static const DTC_Table_t dtc_master_table[] = {
-    {DTC_BRAKE_PMIC_UV,     "Buck Undervoltage Fault",     0},
-    {DTC_BRAKE_PMIC_OV,     "Buck Overvoltage Fault",      0},
-    {DTC_BRAKE_PMIC_OC,     "Buck Overcurrent Fault",      0},
-    {DTC_BRAKE_PMIC_TEMP,   "PMIC Temperature Fault",      0},
-    {DTC_BRAKE_COMM_ERROR,  "I2C Communication Error",     0},
-    {DTC_BRAKE_SYSTEM_FAULT,"System/Power Good Fault",     0}
-};
+// static const DTC_Table_t dtc_master_table[] = {
+//     {DTC_BRAKE_PMIC_UV,     "Buck Undervoltage Fault",     0},
+//     {DTC_BRAKE_PMIC_OV,     "Buck Overvoltage Fault",      0},
+//     {DTC_BRAKE_PMIC_OC,     "Buck Overcurrent Fault",      0},
+//     {DTC_BRAKE_PMIC_TEMP,   "PMIC Temperature Fault",      0},
+//     {DTC_BRAKE_COMM_ERROR,  "I2C Communication Error",     0},
+//     {DTC_BRAKE_SYSTEM_FAULT,"System/Power Good Fault",     0}
+// };
 
  // ========== 감지된 DTC 저장 배열 ==========
 // static DTC_Table_t detected_dtc_table[6];
@@ -755,6 +756,12 @@ void system_init(void)
       Error_Handler();
     }
 
+    // CAN Service 초기화 
+    if (!can_service_init(CAN_SPEED_500K)) {
+        printf("[INIT] :ERROR: CAN Service initialization failed!\n");
+        Error_Handler();
+    }
+
 	printf("[INIT] System initialization completed!...\n");
 }
 
@@ -1289,6 +1296,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  // ✅ TJA1051 S핀 추가 (Silent 제어용)
+    GPIO_InitStruct.Pin = GPIO_PIN_7;  // PB7 (can_service.h에서 정의한 핀)
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct); 
 
   // NVIC 인터럽트 활성화
   HAL_NVIC_SetPriority(EXTI3_IRQn, 2, 0);

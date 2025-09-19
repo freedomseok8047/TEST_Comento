@@ -1,17 +1,19 @@
 /**
  * @file dtc_manager.c
  * @brief DTC 관리 모듈 구현
- * @note main_practice.c에서 이동된 DTC 관련 기능들
+ * @author Brake System Team
+ * @date 2025-09-15
  */
 
 #include "dtc_manager.h"
 #include "eeprom_service.h"
+#include "stm32f4xx_hal.h"
 #include <string.h>
 #include <stdio.h>
 
-// ========== 내부 변수 (main_practice.c에서 이동) ==========
+// ========== 내부 변수 ==========
 
-// 🔄 main_practice.c의 dtc_master_table → 여기로 이동
+// DTC 마스터 테이블 (기본 정보)
 static const DTC_Table_t dtc_master_table[DTC_MAX_COUNT] = {
     {DTC_BRAKE_PMIC_UV,     "Buck Undervoltage Fault",     0, 0, DTC_STATUS_INACTIVE, 0, 0},
     {DTC_BRAKE_PMIC_OV,     "Buck Overvoltage Fault",      0, 0, DTC_STATUS_INACTIVE, 0, 0},
@@ -21,9 +23,12 @@ static const DTC_Table_t dtc_master_table[DTC_MAX_COUNT] = {
     {DTC_BRAKE_SYSTEM_FAULT,"System/Power Good Fault",     0, 0, DTC_STATUS_INACTIVE, 0, 0}
 };
 
-// 🔄 main_practice.c의 detected_dtc_table, dtc_count → 여기로 이동
+// 감지된 DTC 저장 배열
 static DTC_Table_t detected_dtc_table[DTC_MAX_COUNT];
 static uint8_t dtc_count = 0;
+
+// CAN 브로드캐스트 콜백 함수 포인터 (순환 포함 방지)
+static dtc_can_broadcast_func_t can_broadcast_callback = NULL;
 
 // ========== 내부 함수 선언 ==========
 static bool dtc_find_master_entry(uint16_t dtc_code, const DTC_Table_t** master_entry);
@@ -42,27 +47,43 @@ bool dtc_manager_init(void)
     // detected_dtc_table 초기화
     memset(detected_dtc_table, 0, sizeof(detected_dtc_table));
     dtc_count = 0;
+    can_broadcast_callback = NULL;
     
     printf("[DTC] DTC Manager initialized successfully\n");
     return true;
 }
 
 /**
- * @brief DTC 추가 (🔄 main_practice.c의 add_dtc_code 개선 버전)
+ * @brief CAN 브로드캐스트 콜백 함수 설정
+ */
+void dtc_set_can_broadcast_callback(dtc_can_broadcast_func_t callback)
+{
+    can_broadcast_callback = callback;
+    printf("[DTC] CAN broadcast callback registered\n");
+}
+
+/**
+ * @brief DTC 추가
  */
 bool dtc_add_code(uint16_t dtc_code)
 {
     // 1단계: 중복 DTC 확인
-    if (dtc_find_detected_index(dtc_code) >= 0) {
+    int existing_index = dtc_find_detected_index(dtc_code);
+    if (existing_index >= 0) {
         // 이미 존재하는 DTC - 발생 횟수만 증가
-        int index = dtc_find_detected_index(dtc_code);
-        detected_dtc_table[index].occurrence_count++;
-        detected_dtc_table[index].last_occurrence = HAL_GetTick();
+        detected_dtc_table[existing_index].occurrence_count++;
+        detected_dtc_table[existing_index].last_occurrence = HAL_GetTick();
         printf("[DTC] DTC 0x%04X occurrence count updated: %d\n", 
-               dtc_code, detected_dtc_table[index].occurrence_count);
+               dtc_code, detected_dtc_table[existing_index].occurrence_count);
         
         // EEPROM에 업데이트된 정보 저장
-        eeprom_service_save_dtc(dtc_code, detected_dtc_table[index].Description);
+        eeprom_service_save_dtc(dtc_code, detected_dtc_table[existing_index].Description);
+        
+        // CAN으로 업데이트 전송
+        if (can_broadcast_callback != NULL) {
+            if (!can_broadcast_callback(dtc_code, 1)) {  // 1 = Active
+            printf("[DTC] WARNING: Failed to broadcast DTC via CAN\n");
+        }
         
         return true;
     }
@@ -93,13 +114,14 @@ bool dtc_add_code(uint16_t dtc_code)
     printf("[DTC] Added: 0x%04X - %s\n", dtc_code, master_entry->Description);
     dtc_count++;
     
-    // 5단계: 자동으로 EEPROM에 저장
-    printf("[DTC] Auto-saving to EEPROM...\n");
-    if (!eeprom_service_save_dtc(dtc_code, master_entry->Description)) {
-        printf("[DTC] WARNING: Failed to save DTC to EEPROM\n");
-        // DTC 추가는 성공이지만 EEPROM 저장 실패를 알림
-    } else {
-        printf("[DTC] DTC automatically saved to EEPROM\n");
+    // 5단계: EEPROM에 자동 저장
+    eeprom_service_save_dtc(dtc_code, master_entry->Description);
+    
+    // 6단계: CAN으로 DTC 이벤트 브로드캐스트
+    if (can_broadcast_callback != NULL) {
+        if (!can_broadcast_callback(dtc_code, 1)) {  // 1 = Active
+            printf("[DTC] WARNING: Failed to broadcast DTC via CAN\n");
+        }
     }
     
     return true;
@@ -112,7 +134,11 @@ bool dtc_clear_all(void)
 {
     printf("[DTC] Clearing all DTCs (UDS Service 0x14)\n");
     
+    // 클리어 전에 각 DTC의 비활성화를 CAN으로 전송
     for (uint8_t i = 0; i < dtc_count; i++) {
+        if (detected_dtc_table[i].active && can_broadcast_callback != NULL) {
+            can_broadcast_callback(detected_dtc_table[i].DTC_Code, 0);  // 0 = Inactive
+        }
         detected_dtc_table[i].active = 0;
         detected_dtc_table[i].status = DTC_STATUS_INACTIVE;
         printf("[DTC] Cleared: 0x%04X\n", detected_dtc_table[i].DTC_Code);
@@ -123,12 +149,7 @@ bool dtc_clear_all(void)
     dtc_count = 0;
     
     // EEPROM에서도 클리어
-    printf("[DTC] Clearing DTCs from EEPROM...\n");
-    if (!eeprom_service_clear_all_dtc()) {
-        printf("[DTC] WARNING: Failed to clear DTCs from EEPROM\n");
-    } else {
-        printf("[DTC] DTCs cleared from EEPROM successfully\n");
-    }
+    eeprom_service_clear_all_dtc();
     
     printf("[DTC] All DTCs cleared successfully\n");
     return true;
@@ -143,6 +164,11 @@ bool dtc_clear_specific(uint16_t dtc_code)
     if (index < 0) {
         printf("[DTC] DTC 0x%04X not found for clearing\n", dtc_code);
         return false;
+    }
+    
+    // CAN으로 비활성화 전송
+    if (can_broadcast_callback != NULL) {
+        can_broadcast_callback(dtc_code, 0);  // 0 = Inactive
     }
     
     detected_dtc_table[index].active = 0;
@@ -182,14 +208,13 @@ uint8_t dtc_get_list(DTC_Table_t* dtc_list, uint8_t max_count)
 }
 
 /**
- * @brief DTC 요약 출력 (🔄 main_practice.c의 print_dtc_summary 개선 버전)
+ * @brief DTC 요약 출력
  */
 void dtc_print_summary(void)
 {
-    printf("\n========= DTC SUMMARY (UDS Format) ===========\n");
+    printf("\n========= DTC SUMMARY ===========\n");
     printf("Total detected DTCs: %d\n", dtc_count);
     printf("Active DTCs: %d\n", dtc_get_active_count());
-    printf("EEPROM stored DTCs: %d\n", eeprom_service_get_dtc_count());
     
     if (dtc_count == 0) {
         printf("No faults detected - System OK\n");
@@ -210,15 +235,11 @@ void dtc_print_summary(void)
         }
     }
     
-    // EEPROM 상태 출력
-    printf("\nEEPROM Storage Status:\n");
-    eeprom_service_print_status();
-    
-    printf("=============================================\n\n");
+    printf("=================================\n\n");
 }
 
 /**
- * @brief 진단 상태 리셋 (🔄 main_practice.c의 reset_pmic_diagnosis 일부)
+ * @brief 진단 상태 리셋
  */
 void dtc_reset_diagnosis(void)
 {

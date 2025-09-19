@@ -3,9 +3,6 @@
  * @brief DTC(Diagnostic Trouble Code) 관리 모듈
  * @author Brake System Team
  * @date 2025-09-15
- * 
- * @note UDS 프로토콜 기반 DTC 관리
- *       main_practice.c에서 DTC 관련 기능 분리
  */
 
 #ifndef DTC_MANAGER_H
@@ -15,7 +12,7 @@
 #include <stdbool.h>
 #include "common_types.h"
 
-// ========== DTC 코드 정의 (main_practice.c에서 이동) ==========
+// ========== DTC 코드 정의 ==========
 typedef enum {
     DTC_BRAKE_PMIC_UV     = 0xC001,  // Under Voltage
     DTC_BRAKE_PMIC_OV     = 0xC002,  // Over Voltage  
@@ -35,22 +32,25 @@ typedef enum {
     DTC_STATUS_WARNING_INDICATOR  = 0x10
 } dtc_status_t;
 
-// ========== DTC 테이블 구조체 (main_practice.c에서 개선) ==========
+// ========== DTC 테이블 구조체 ==========
 #pragma pack(push, 1)
 typedef struct {
     uint16_t DTC_Code;              // DTC 코드
     char Description[50];           // 설명 문자열
     uint8_t active;                 // 활성화 상태
-    uint8_t occurrence_count;       // 발생 횟수 (추가)
-    dtc_status_t status;            // UDS 상태 (추가)
-    uint32_t first_occurrence;      // 최초 발생 시간 (추가)
-    uint32_t last_occurrence;       // 최근 발생 시간 (추가)
+    uint8_t occurrence_count;       // 발생 횟수
+    dtc_status_t status;            // UDS 상태
+    uint32_t first_occurrence;      // 최초 발생 시간
+    uint32_t last_occurrence;       // 최근 발생 시간
 } DTC_Table_t;
 #pragma pack(pop)
 
 // ========== DTC 관리 설정 ==========
 #define DTC_MAX_COUNT           6       // 최대 DTC 개수
 #define DTC_DESCRIPTION_SIZE    50      // 설명 최대 길이
+
+// ========== CAN 브로드캐스트 콜백 함수 타입 ==========
+typedef bool (*dtc_can_broadcast_func_t)(uint16_t dtc_code, uint8_t status);
 
 // ========== 전역 함수 선언 ==========
 
@@ -61,7 +61,13 @@ typedef struct {
 bool dtc_manager_init(void);
 
 /**
- * @brief DTC 추가 (main_practice.c의 add_dtc_code 대체)
+ * @brief CAN 브로드캐스트 콜백 함수 설정
+ * @param callback CAN 전송 함수 포인터
+ */
+void dtc_set_can_broadcast_callback(dtc_can_broadcast_func_t callback);
+
+/**
+ * @brief DTC 추가
  * @param dtc_code 추가할 DTC 코드
  * @return true: 성공, false: 실패/중복
  */
@@ -95,12 +101,12 @@ uint8_t dtc_get_active_count(void);
 uint8_t dtc_get_list(DTC_Table_t* dtc_list, uint8_t max_count);
 
 /**
- * @brief DTC 요약 출력 (main_practice.c의 print_dtc_summary 대체)
+ * @brief DTC 요약 출력
  */
 void dtc_print_summary(void);
 
 /**
- * @brief 진단 상태 리셋 (main_practice.c의 reset_pmic_diagnosis 일부)
+ * @brief 진단 상태 리셋
  */
 void dtc_reset_diagnosis(void);
 

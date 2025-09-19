@@ -1,4 +1,4 @@
-//* USER CODE BEGIN Header */
+/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
@@ -16,61 +16,260 @@
   *
   ******************************************************************************
   */
+ /* ECU 제어 시스템 시퀀스 정리 (전체 구조 설명)
+====================================================================================
+① MCU Power-On → BootROM → Reset_Handler → SystemInit() → HAL_Init() → Clock Init
+② MX_GPIO/DMA/ADC/CAN/I2C/SPI/UART 초기화
+③ HAL_CAN_Start() / HAL_CAN_ActivateNotification() 활성화 (수신 인터럽트 준비)
+④ SPI EEPROM → EEPROM_ReadDTC() 호출 (이전 DTC 복구)
+⑤ FreeRTOS osKernelInitialize()
+⑥ FreeRTOS Mutex 생성 (CommMutexHandleHandle)
+⑦ FreeRTOS Queue 생성 (CanQueueHandle)
+⑧ FreeRTOS Task 생성 (I2CTask → SPITask → CANTask → UARTTask)
+⑨ osKernelStart() → 스케줄러 시작
+⑩ 각 Task 별 역할 수행:
+    - I2CTask: PMIC I2C 0x07 FAULT_STATUS1 레지스터 주기 확인
+    - SPITask: EEPROM에 DTC 주기적 백업
+    - CANTask: CAN 수신 데이터 Queue 처리 → OBD2/UDS 명령 응답
+    - UARTTask: 상태 출력 디버깅
+⑪ UV Fault 감지 시 DTC 활성화 → EEPROM 기록
+⑫ OBD2, UDS CAN 진단 요청 시 현재 DTC 응답
+====================================================================================*/
+
+/*
+=========================================================================================================================
+Full ECU DTC 관리 시스템 - STM32F413ZHTx 부팅부터 Task 실행까지 상세 동작 시퀀스 설명
+=========================================================================================================================
+
+### [0] STM32F413ZHTx BootROM → Reset Flow 상세 시퀀스
+
+① 시스템 전원 인가 (3.3V VDD / VDDIO → 내부 LDO로 CORE 1.2V 공급 시작)
+
+② STM32F413ZHTx 내부 BootROM 실행 (핸드오프 순서)
+    - Option Bytes → Boot Pin → 부팅 모드 결정 (일반적으로 Flash 부팅)
+
+③ Reset_Handler() 진입 (Vector Table 기준 초기 핸들러)
+
+④ 초기화 루틴 (CRT Startup) 실행:
+   - 초기 MSP (Main Stack Pointer) 설정 (SP ← __StackTop 주소)
+   - 벡터 테이블 설정 (SCB->VTOR 설정 → Flash 0x0800 0000)
+   - .data 섹션 초기화 (Flash에서 RAM으로 초기 데이터 복사)
+   - .bss 섹션 초기화 (RAM의 초기화되지 않은 변수 0으로 클리어)
+   - SystemInit() 함수 호출 → 클럭/PLL 설정
+   - main() 함수로 분기
+
+=========================================================================================================================
+
+### [1] main() 함수 시스템 초기화
+
+① HAL_Init() → HAL Library 전체 초기화 (SysTick, NVIC, 기본 IRQ, HAL State)
+
+② SystemClock_Config() → 내부 HSI 16MHz 클럭 → SYSCLK 설정
+    (PLL 사용 안함 → HSI 직접 SYSCLK 소스로 사용)
+
+③ 각 주변장치 Peripheral 초기화
+
+- MX_GPIO_Init() → 모든 입출력 핀 모드 설정 (SPI/I2C/UART/CAN CS 핀 포함)
+- MX_DMA_Init() → DMA 스트림 활성화 (SPI/I2C 연동)
+- MX_ADC1_Init() → ADC 설정 (현재 미사용)
+- MX_CAN1_Init() → CAN 통신 초기화 (OBD2/UDS)
+- MX_I2C1_Init() → PMIC I2C 통신용 초기화 (100kHz)
+- MX_SPI1_Init() → EEPROM SPI 통신용 초기화 (EEPROM 25LC256)
+- MX_UART4_Init() → 디버깅 UART 설정 (115200bps)
+
+=========================================================================================================================
+
+### [2] EEPROM → DTC 복구
+
+- SPI1 이용 → EEPROM_ReadDTC() 함수 호출
+- EEPROM (25LC256) 0x0000 주소에서 DTC Table 복원
+- 전원 끊김 후에도 기존 Fault 이력 유지
+
+=========================================================================================================================
+
+### [3] FreeRTOS RTOS 초기화
+
+① osKernelInitialize() 호출 → RTOS 커널 준비
+② Mutex 생성: CommMutexHandleHandle
+③ Queue 생성: CanQueueHandle (CAN RX 메시지 수신 큐)
+
+④ Task 생성:
+- StartDefaultTask (idle 용)
+- StartI2CTask (PMIC 상태 모니터링)
+- StartSPITask (EEPROM 기록)
+- StartCANTask (CAN 명령 파싱)
+- StartUARTTask (디버깅)
+
+⑤ osKernelStart() → FreeRTOS 스케줄러 시작
+
+=========================================================================================================================
+
+### [4] RTOS Task 상세 동작 시퀀스
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│ Task Name │ 주기  │ 주요 동작 내용                    │ Mutex 사용 │
+├───────────┼──────┼───────────────────────────────┼─────────────┤
+│ I2CTask   │ 500ms│ PMIC 0x07 (FAULT_STATUS1) 읽기 │ I2C 보호 │
+│ SPITask   │ 5s   │ EEPROM 주기적 DTC 백업 		   │ SPI 보호 │
+│ CANTask   │ 이벤트 │ CAN Queue Polling → 명령 파싱    │ CAN 보호 │
+│ UARTTask  │ 1s   │ 디버깅 메시지 출력                  │ UART 보호 │
+│ defaultTask│ idle│ 기본 유휴 루프                     │ (미사용) │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+=========================================================================================================================
+
+### [5] PMIC (MP5475GU) UV Fault 감지
+
+① I2CTask 주기마다 I2C1 통해 0x60 주소 → 0x07 레지스터 읽기
+
+② faultReg & 0x01 → UV_FAULT_A (Under Voltage A) 발생 확인
+
+③ 신규 Fault 발생시 DTC 활성화 → EEPROM 기록
+
+※ 반복적으로 같은 Fault가 발생해도 EEPROM에는 1회만 기록 (기록 횟수 보호)
+
+=========================================================================================================================
+
+### [6] CAN 수신 처리 흐름 (Queue 기반)
+
+① CAN 인터럽트 발생 (RX_FIFO0_MSG_PENDING)
+
+② HAL_CAN_RxFifo0MsgPendingCallback() ISR 실행
+
+③ HAL_CAN_GetRxMessage()로 Frame 수신
+
+④ osMessageQueuePut() 통해 CanQueueHandle 큐에 메시지 삽입
+
+⑤ CANTask에서 osMessageQueueGet() → 큐 Polling → 명령 파싱 시작
+
+=========================================================================================================================
+
+### [7] CAN 명령 → OBD2 / UDS DTC 파싱
+
+① OBD2 규격:
+- 요청 프레임: 0x7DF → 응답: 0x7E8
+- Read DTC: PID 03 (0x43)
+- Clear DTC: PID 04 (0x04)
+
+② UDS 규격:
+- Read DTC: SID $19 (0x19)
+- Clear DTC: SID $14 (0x14)
+
+③ Process_OBD2_Read() / Process_UDS_Read() 호출
+- DTC_Table.active 에 따라 응답 구성 후 CAN 송출
+
+④ Process_OBD2_Clear() / Process_UDS_Clear() 호출
+- DTC 비활성화 → EEPROM 재기록
+
+=========================================================================================================================
+
+### [8] EEPROM 기록 과정 상세 (SPI1)
+
+① EEPROM_WriteEnable() → WREN 명령 전송 (0x06)
+
+② EEPROM Write 명령 (0x02) + 주소 0x0000 전송
+
+③ DTC_Table 전체 구조체 SPI 전송
+
+④ CS 핀 해제 → 기록 완료
+
+⑤ 재부팅시 EEPROM_ReadDTC() → RAM으로 복구
+
+=========================================================================================================================
+
+### [9] Mutex (FreeRTOS 보호 메커니즘)
+
+- I2C1, SPI1, UART4, CAN1 전송에 대해 Mutex 보호
+
+① osMutexAcquire(CommMutexHandleHandle, osWaitForever)
+② HAL API 호출 (통신 수행)
+③ osMutexRelease(CommMutexHandleHandle)
+
+※ 통신 자원 공유시 전형적인 RTOS 충돌 방지 기법
+
+=========================================================================================================================
+---------------------------------------------------------------------------------------
+
+전체 통신 프로토콜 요약:
+
+PMIC: MP5475GU (I2C: 0x60 << 1), FAULT_STATUS1 0x07
+EEPROM: 25LC256 (SPI), 25LC256 명령어 (WREN, READ, WRITE)
+CAN Protocol: ISO15765 (OBD2/UDS), 기본 PID/Service 사용 예시
+- OBD2: SAE J1979 (PID 03/04 사용)
+- UDS: ISO 14229-1 (SID $19 / $14 사용)
+DTC Code 예시: 0x1234 (Brake UV Fault)
+
+---------------------------------------------------------------------------------------
+
+Reference (참고 URL):
+1️ OBD-II 전체 설명 사이트
+ https://www.obd-codes.com/
+
+2️ UDS 프로토콜 기초 설명
+ https://vector.com/uds-tutorial
+ https://en.wikipedia.org/wiki/Unified_Diagnostic_Services
+
+3️ ISO/SAE 표준 구입 사이트 (정식 국제 표준문서 필요시)
+ https://www.iso.org/standard/61088.html (ISO 14229-1)
+ https://www.sae.org/standards (SAE J1979, J2012)
+
+https://en.wikipedia.org/wiki/OBD-II_PIDs#Mode_03
+https://en.wikipedia.org/wiki/OBD-II_PIDs
+https://en.wikipedia.org/wiki/Unified_Diagnostic_Services
+
+- UDS: https://en.wikipedia.org/wiki/Unified_Diagnostic_Services
+- OBD2: https://en.wikipedia.org/wiki/On-board_diagnostics
+- EEPROM 25LC256 Datasheet: https://ww1.microchip.com/downloads/en/DeviceDoc/25LC256.pdf
+- PMIC MP5475GU Datasheet: https://www.monolithicpower.com/en/documentview/productdocument/index/version/2/document_type/Datasheet/lang/en/sku/MP5475GU/
+=======================================================================================
+*/
+
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-#include <stdio.h>
 #include <string.h>
-#include <stdarg.h>
-#include "PMIC.h"
-#include "DTC.h"
-#include "EEPROM.h"
 
+void EEPROM_ReadDTC(void);
+// --- DTC 데이터 구조 정의 ---
+typedef struct {
+  uint16_t DTC_Code;              // 고장 코드 (예: C1234)
+  char Description[50];           // 설명 문자열
+  uint8_t active;                 // 활성화 상태 플래그
+} DTC_Table_t;
+
+DTC_Table_t DTC_Table = { 0x1234, "Brake UV Fault", 0 };
+
+// SPI EEPROM 명령어
+#define EEPROM_CMD_WREN  0x06
+#define EEPROM_CMD_WRITE 0x02
+#define EEPROM_CMD_READ  0x03
+#define EEPROM_DTC_ADDR  0x0000
+
+// PMIC 주소 및 레지스터
+#define PMIC_I2C_ADDR  (0x60 << 1)      // MP5475GU I2C 7bit 주소
+#define PMIC_FAULT_STATUS1_REG  0x07    // FAULT_STATUS1 레지스터
 /* USER CODE END Includes */
-
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
-
-/* USER CODE END PTD */
-
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-
-// SPI 칩셀렉트 핀
-#define SPI1_CS_GPIO_Port  GPIOB
-#define SPI1_CS_Pin        GPIO_PIN_0	// 0번PB0를 SPI1의 CS로 이용
-#define SPI1_CS_HIGH()     HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_SET)
-#define SPI1_CS_LOW()      HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_RESET)
-// PMIC I2C 레지스터 주소(enum)
-// TODO: 데이터시트 표의 실제 주소로 교체 해야함
-
-
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
+
 CAN_HandleTypeDef hcan1;
+
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 DMA_HandleTypeDef hdma_i2c1_rx;
 DMA_HandleTypeDef hdma_i2c1_tx;
 DMA_HandleTypeDef hdma_i2c2_rx;
 DMA_HandleTypeDef hdma_i2c2_tx;
+
 SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
 DMA_HandleTypeDef hdma_spi1_rx;
 DMA_HandleTypeDef hdma_spi1_tx;
 DMA_HandleTypeDef hdma_spi2_rx;
 DMA_HandleTypeDef hdma_spi2_tx;
+
 UART_HandleTypeDef huart4;
 
 /* Definitions for defaultTask */
@@ -118,40 +317,8 @@ osMutexId_t CommMutexHandleHandle;
 const osMutexAttr_t CommMutexHandle_attributes = {
   .name = "CommMutexHandle"
 };
-
-
 /* USER CODE BEGIN PV */
-// PMIC I2C DMA 상태머신
-typedef enum {
-  PMIC_DMA_IDLE = 0,
-  PMIC_DMA_READING_VOLT,
-  PMIC_DMA_READING_CURR,
-  PMIC_DMA_READING_TEMP
-} PMIC_DMA_State_t;
 
-// I2C DMA 상태머신의 현재 단계를 저장
-static volatile PMIC_DMA_State_t g_pmic_state = PMIC_DMA_IDLE;
-// 전압 Fault 레지스터에서 읽어온 8바이트
-static PMIC_Fault8_t g_fault_volt = {0};
-// 전류(Current) Fault 레지스터에서 읽어온 8바이트
-static PMIC_Fault8_t g_fault_curr = {0};
-
-
-// 루프 단계: I2C -> SPI -> CAN -> UART
-typedef enum { PH_I2C=0, PH_SPI, PH_CAN, PH_UART } loop_phase_t;
-static loop_phase_t s_phase = PH_I2C;
-
-#define DTC_CODE_BRAKE_PRESSURE_UV   (0xC121)  // DTC 예시코드
-#define DTC_CODE_BRAKE_MOTOR_OC      (0xC122)  // DTC 예시코드
-static DTC_Record_t g_last_dtc = {0};          // 마지막 발생 DTC
-
-
-// CAN 수신 버퍼 (예시)
-static CAN_RxHeaderTypeDef g_can_rx_hdr;
-static uint8_t             g_can_rx_data[8];
-
-// 주기 로그 타이밍
-static uint32_t g_last_log_ms = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -165,196 +332,30 @@ static void MX_I2C2_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_UART4_Init(void);
-
 void StartDefaultTask(void *argument);
 void StartI2CTask(void *argument);
 void StartSPITask(void *argument);
 void StartCANTask(void *argument);
 void StartUARTTask(void *argument);
 
-
-/* USER CODE BEGIN PFP */
-// ===== UART 로깅 함수 =====
-// printf 처럼 문자열을 만들어서 UART4로 전송하는 함수
-// → 디버깅 메시지, Fault 상태 로그 출력
-void UART4_Log(const char *fmt, ...);
-
-// ===== CAN 필터 설정 및 시작 함수 =====
-// CAN1을 "모든 메시지를 수신"하도록 필터를 설정하고 CAN을 시작
-// → 복잡한 필터링 설정 대신 간단히 통신이 되는지 확인할 때 사용
-static void CAN1_ConfigSimple(void);
-
-// ===== CAN 데이터 전송 함수 =====
-// 8바이트 데이터를 표준 ID(0x123)로 CAN 버스로 송신
-// → I2C에서 읽은 Fault 상태 데이터를 그대로 CAN에 송신할 때 사용
-static void CAN1_Send8(const uint8_t *data);
-
-/* ADC helper */
-static uint16_t ADC_Read_mV(ADC_HandleTypeDef *hadc, uint32_t channel);
-
-/* USER CODE END PFP */
-
-/* Private user code ---------------------------------------------------------*/
-
-/* USER CODE BEGIN 0 */
-// I2C에서 8바이트 읽기(메모리 읽기)
-// PMIC 내부 레지스터인 reg에서 연속 8바이트를 폴링 방식으로 I2C로 읽어 out(PMIC_Fault_8_t)를 가리키는 포인터 -> raw에 채움
-// out->raw : out이 가리키는 PMIC_Fault8_t의 raw 배열 (= frame.raw)
-
-void PMIC_ConfigPGasInput(void)
-{
-  HAL_GPIO_DeInit(PMIC_PG_GPIO_Port, PMIC_PG_Pin);
-
-  GPIO_InitTypeDef gi = {0};
-  gi.Pin   = PMIC_PG_Pin;
-  gi.Mode  = GPIO_MODE_INPUT;   // 입력으로
-  gi.Pull  = GPIO_PULLUP;       // 회로에 따라 PULLDOWN/NOPULL로 조정
-  gi.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(PMIC_PG_GPIO_Port, &gi);
-}
-
-
-// PG 안정 확인
-// timeout_ms 동안, 'stable_count' 회 연속 원하는 레벨(Active-High/Low)인가?
-static bool PMIC_WaitForPG(GPIO_TypeDef *port, uint16_t pin,
-                           uint32_t timeout_ms, uint8_t stable_count)
-{
-  uint32_t t0 = HAL_GetTick();
-  uint8_t good = 0;
-
-  while ((HAL_GetTick() - t0) < timeout_ms) {
-    GPIO_PinState s = HAL_GPIO_ReadPin(port, pin);
-    bool ok = PMIC_PG_ACTIVE_HIGH ? (s == GPIO_PIN_SET) : (s == GPIO_PIN_RESET);
-
-    if (ok) {
-      if (++good >= stable_count) return true;  // 충분히 안정
-    } else {
-      good = 0; // 한 번이라도 틀리면 연속 카운터 초기화
-    }
-
-    HAL_Delay(1); // 1ms 주기로 샘플링
-  }
-  return false; // 타임아웃
-}
-
-// I2C 기본값 체크
-static bool PMIC_CheckI2CDefaults(void)
-{
-  // 슬레이브 응답 확인
-  if (HAL_I2C_IsDeviceReady(&hi2c1, PMIC_I2C_ADDR, 3, 10) != HAL_OK) {
-    UART4_Log("[PMIC] I2C not ready\r\n");
-    return false;
-  }
-
-  // 1) Fault: 전압/전류/온도 → 파워온 직후 보통 '모두 0' 기대
-  PMIC_Fault8_t v = {0}, c = {0};
-
-  if (PMIC_Read8(&hi2c1, PMIC_REG_FAULT_VOLT, v.raw) != HAL_OK) {
-    UART4_Log("[PMIC] read VOLT fault fail\r\n"); return false;
-  }
-  if (PMIC_Read8(&hi2c1, PMIC_REG_FAULT_CURR, c.raw) != HAL_OK) {
-    UART4_Log("[PMIC] read CURR fault fail\r\n"); return false;
-  }
-
-  // 2) '모두 0'인지 검사 (한 바이트라도 0이 아니면 초기 고장 래치로 판단)
-  bool volt_zero = true, curr_zero = true;
-  for (int i = 0; i < 8; ++i) {
-    if (v.raw[i] != 0x00) volt_zero = false;
-    if (c.raw[i] != 0x00) curr_zero = false;
-  }
-
-  if (!volt_zero) {
-    UART4_Log("[PMIC] FAULT_VOLT not zero @POR (check DS/board)\r\n");
-    return false;
-  }
-  if (!curr_zero) {
-    UART4_Log("[PMIC] FAULT_CURR not zero @POR (check DS/board)\r\n");
-    return false;
-  }
-
-  UART4_Log("[PMIC] Defaults OK: FAULT(V/C/T)=all-zero\r\n");
-
-  return true; // 모든 기본값 검사 통과
-}
-
-
-
-// CAN 필터 간단 설정 후 시작
-static void CAN1_ConfigSimple(void)
-{
-  CAN_FilterTypeDef f = {0};
-  f.FilterActivation = ENABLE;
-  f.FilterBank = 0;
-  f.FilterFIFOAssignment = CAN_FILTER_FIFO0;
-  f.FilterMode  = CAN_FILTERMODE_IDMASK;
-  f.FilterScale = CAN_FILTERSCALE_32BIT;
-  HAL_CAN_ConfigFilter(&hcan1, &f);
-  HAL_CAN_Start(&hcan1);
-
-  //수신 알림 활성화 + NVIC
-  HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
-  HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
-}
-
-// CAN 8바이트 송신
-static void CAN1_Send8(const uint8_t *data)
-{
-  CAN_TxHeaderTypeDef tx = {0};
-  uint32_t mbox;
-  tx.IDE = CAN_ID_STD;
-  tx.StdId = 0x123;  // TODO: 시스템에 맞게 data 변경
-  tx.RTR = CAN_RTR_DATA;
-  tx.DLC = 8;
-  HAL_CAN_AddTxMessage(&hcan1, &tx, (uint8_t*)data, &mbox);
-
-  uint32_t t0 = HAL_GetTick();
-  while (HAL_CAN_IsTxMessagePending(&hcan1, mbox)) {
-    if (HAL_GetTick() - t0 > 10) break;
-  }
-}
-
-
-// UART 텍스트 출력
-static void UART4_Log(const char *fmt, ...)
-{
-  char buf[128];
-  va_list ap;
-  va_start(ap, fmt);
-  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-  va_end(ap);
-  if (n < 0) return;
-  if (n > (int)sizeof(buf)) n = sizeof(buf);
-  HAL_UART_Transmit(&huart4, (uint8_t*)buf, (uint16_t)n, 100);
-}
-/* USER CODE END 0 */
-
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
-
-
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-
+  // MCU 부팅: BootROM → Reset_Handler → SystemInit() → main() 진입
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+  HAL_Init();  // HAL 라이브러리 초기화
 
   /* USER CODE BEGIN Init */
-
   /* USER CODE END Init */
 
   /* Configure the system clock */
-  SystemClock_Config();
+  SystemClock_Config();  // 시스템 클럭 설정
 
   /* USER CODE BEGIN SysInit */
-
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -367,166 +368,41 @@ int main(void)
   MX_SPI1_Init();
   MX_SPI2_Init();
   MX_UART4_Init();
+
   /* USER CODE BEGIN 2 */
-  // DTC(=EEPRO) 초기화 (SPI1, CS=PB0)
-  if (!DTC_Init(&hspi1, SPI1_CS_GPIO_Port, SPI1_CS_Pin)) {
-    UART4_Log("[DTC] init failed\r\n");
-    Error_Handler();
-  }
+  // CAN 초기화 후 수신 인터럽트 활성화
+  HAL_CAN_Start(&hcan1);
+  HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
 
-  // CAN 필터 설정 및 시작, interrupt 활성화
-  CAN1_ConfigSimple();
-
-  //PG 핀을 입력으로 재설정, 전원 정상(PG=OK) 안정될 때까지 잠시 대기 -> 연속 5회
-  PMIC_ConfigPGasInput();
-  if (!PMIC_WaitForPG(PMIC_PG_GPIO_Port, PMIC_PG_Pin, 200, 5)) {
-    UART4_Log("[PMIC] PG not stable. abort init\r\n");
-    Error_Handler();
-  }
-
-  // I2C 기본값(디폴트) 확인 (Fault 블록들이 Power-On에서 all-zero인지)
-  if (!PMIC_CheckI2CDefaults()) {
-    UART4_Log("[PMIC] I2C defaults check failed\r\n");
-    Error_Handler();
-  }
-
-  // MCU/IC 전압 인가(I2C Write) : BUCK1을 원하는 전압으로 설정 후 Enable
-  if (PMIC_SetBuck1Voltage_mV(&hi2c1, 1200) != HAL_OK) {
-    UART4_Log("[PMIC] BUCK1 apply failed\r\n");
-    Error_Handler();
-  }
-  // 전압 안정화 짧은 대기 + PG 재확인
-  HAL_Delay(2);
-
-  // I2C DMA 감시 시작: 전압 Fault 레지스터 8바이트 읽기
-  g_pmic_state = PMIC_DMA_READING_VOLT;
-  if (HAL_I2C_Mem_Read_DMA(&hi2c1,
-                             PMIC_I2C_ADDR,                     // 7bit 주소<<1
-                             (uint16_t)PMIC_REG_FAULT_VOLT,     // 시작 레지스터
-                             I2C_MEMADD_SIZE_8BIT,              // 내부주소 8bit
-                             g_fault_volt.raw,                  // 수신 버퍼(8바이트)
-                             8) != HAL_OK) {
-      UART4_Log("[PMIC] I2C DMA start fail\r\n");
-      Error_Handler();
-    }
-
-  UART4_Log("[PMIC] init OK. entering main loop...\r\n");
-
-
+  // 부팅 시 EEPROM에 저장된 이전 DTC 정보 복구
+  EEPROM_ReadDTC();
   /* USER CODE END 2 */
 
   /* Init scheduler */
-  //osKernelInitialize();
+  osKernelInitialize();  // RTOS 커널 초기화
+
   /* Create the mutex(es) */
-  /* creation of CommMutexHandle */
-  //CommMutexHandleHandle = osMutexNew(&CommMutexHandle_attributes);
-
-  /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
-  /* USER CODE END RTOS_MUTEX */
-
-  /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
-  /* USER CODE END RTOS_SEMAPHORES */
-
-  /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
-  /* USER CODE END RTOS_TIMERS */
+  CommMutexHandleHandle = osMutexNew(&CommMutexHandle_attributes);  // 통신 Mutex 생성
 
   /* Create the queue(s) */
-  /* creation of CanQueue */
-  //CanQueueHandle = osMessageQueueNew (8, 8, &CanQueue_attributes);
-
-  /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
-  /* USER CODE END RTOS_QUEUES */
+  CanQueueHandle = osMessageQueueNew(8, 8, &CanQueue_attributes);  // CAN 수신 큐 생성
 
   /* Create the thread(s) */
-  /* creation of defaultTask */
-  //defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
-
-  /* creation of I2CTask */
-  //I2CTaskHandle = osThreadNew(StartI2CTask, NULL, &I2CTask_attributes);
-
-  /* creation of SPITask */
-  //SPITaskHandle = osThreadNew(StartSPITask, NULL, &SPITask_attributes);
-
-  /* creation of CANTask */
-  //CANTaskHandle = osThreadNew(StartCANTask, NULL, &CANTask_attributes);
-
-  /* creation of UARTTask */
-  //UARTTaskHandle = osThreadNew(StartUARTTask, NULL, &UARTTask_attributes);
-
-  /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
-  /* USER CODE END RTOS_THREADS */
-
-  /* USER CODE BEGIN RTOS_EVENTS */
-  /* add events, ... */
-  /* USER CODE END RTOS_EVENTS */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  I2CTaskHandle = osThreadNew(StartI2CTask, NULL, &I2CTask_attributes);
+  SPITaskHandle = osThreadNew(StartSPITask, NULL, &SPITask_attributes);
+  CANTaskHandle = osThreadNew(StartCANTask, NULL, &CANTask_attributes);
+  UARTTaskHandle = osThreadNew(StartUARTTask, NULL, &UARTTask_attributes);
 
   /* Start scheduler */
-  //osKernelStart();
+  osKernelStart();
 
-  /* We should never get here as control is now taken by the scheduler */
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-
   while (1)
   {
-	  switch (s_phase) {
-
-	     case PH_I2C:
-	         // I2C 단계: PMIC Fault 스냅샷 읽기 시작 (DMA)
-	         if (g_pmic_state == PMIC_DMA_IDLE) {
-	             g_pmic_state = PMIC_DMA_READING_VOLT;
-	             (void)HAL_I2C_Mem_Read_DMA(&hi2c1,
-	                                        PMIC_I2C_ADDR,
-	                                        (uint16_t)PMIC_REG_FAULT_VOLT,
-	                                        I2C_MEMADD_SIZE_8BIT,
-	                                        g_fault_volt.raw, 8);
-	         }
-	         s_phase = PH_SPI;
-	         break;
-
-	     case PH_SPI: {
-	         // SPI 단계: EEPROM에서 최신 DTC 1건을 읽어 확인 (내부적으로 SPI DMA 사용)
-	    	 DTC_Record_t rec;
-	    	 (void)DTC_ReadLatestRecord(&rec);
-	         s_phase = PH_CAN;
-	         break;
-	     }
-
-	     case PH_CAN:
-	         // CAN 단계: 최신 DTC를 표준 ID(0x700)로 1프레임 송신
-	         (void)DTC_SendLatestOverCAN(&hcan1, 0x700);
-	         s_phase = PH_UART;
-	         break;
-
-	     case PH_UART: {
-	         static uint32_t last_log = 0;
-	         uint32_t now = HAL_GetTick();
-	         if (now - last_log >= 100u) {
-	             last_log = now;
-	             UART4_Log("[OK] alive, UV:%u OC:%u OT:%u\r\n",
-	               (unsigned)(g_fault_volt.bits.buck1_uv | g_fault_volt.bits.buck2_uv),
-	               (unsigned)(g_fault_curr.bits.buck1_oc | g_fault_curr.bits.buck2_oc),
-	               (unsigned)(g_fault_temp.bits.temp_fault)); // ★ 온도
-	         }
-	         s_phase = PH_I2C;
-	         break;
-      }
-
-      } // switch
+    // 절대 도달하지 않음 (스케줄러가 Task 관리)
   }
 }
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-
-  /* USER CODE END 3 */
-
-
 /**
   * @brief System Clock Configuration
   * @retval None
@@ -896,75 +772,15 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : PB2 */
   GPIO_InitStruct.Pin = GPIO_PIN_2;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;         // 입력
-  GPIO_InitStruct.Pull = GPIO_PULLUP;             // 보드에 맞춰 PULLUP/PULLDOWN 조정
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
 }
 
 /* USER CODE BEGIN 4 */
-/* USER CODE BEGIN CALLBACKS */
 
-extern void EEPROM_OnTxCpltIRQ(SPI_HandleTypeDef *hspi);
-extern void EEPROM_OnRxCpltIRQ(SPI_HandleTypeDef *hspi);
-
-void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
-{
-    EEPROM_OnTxCpltIRQ(hspi);  // CS HIGH + 상태 IDLE
-}
-
-void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
-{
-    EEPROM_OnRxCpltIRQ(hspi);  // CS HIGH + 상태 IDLE
-}
-
-
-// I2C DMA 수신 완료 콜백
-void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
-{
-    if (hi2c != &hi2c1) return;
-
-    if (g_pmic_state == PMIC_DMA_READING_VOLT) {
-        g_pmic_state = PMIC_DMA_READING_CURR;
-        HAL_I2C_Mem_Read_DMA(&hi2c1, PMIC_I2C_ADDR,
-                             (uint16_t)PMIC_REG_FAULT_CURR, I2C_MEMADD_SIZE_8BIT,
-                             g_fault_curr.raw, 8);
-    }
-    else if (g_pmic_state == PMIC_DMA_READING_CURR) {
-        g_pmic_state = PMIC_DMA_READING_TEMP;
-        HAL_I2C_Mem_Read_DMA(&hi2c1, PMIC_I2C_ADDR,
-                             (uint16_t)PMIC_REG_FAULT_TEMP, I2C_MEMADD_SIZE_8BIT,
-                             g_fault_temp.raw, 8);
-    }
-    else if (g_pmic_state == PMIC_DMA_READING_TEMP) {
-        g_pmic_state = PMIC_DMA_IDLE;
-
-        // 세 스냅샷으로 평가/저장 (temp 포함)
-        (void)DTC_EvaluateAndSaveFromPmic(&g_fault_volt, &g_fault_curr, &g_fault_temp);
-
-        // 다음 주기 다시 VOLT부터
-        g_pmic_state = PMIC_DMA_READING_VOLT;
-        HAL_I2C_Mem_Read_DMA(&hi2c1, PMIC_I2C_ADDR,
-                             (uint16_t)PMIC_REG_FAULT_VOLT, I2C_MEMADD_SIZE_8BIT,
-                             g_fault_volt.raw, 8);
-    }
-}
-
-
-// CAN RX: 메시지 도착 콜백
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
-{
-  if (hcan != &hcan1) return;
-  if (HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &g_can_rx_hdr, g_can_rx_data) == HAL_OK) {
-    // 수신 처리
-    UART4_Log("[CAN RX] ID:0x%03lX DLC:%d DATA:%02X %02X %02X %02X %02X %02X %02X %02X\n",
-              g_can_rx_hdr.StdId, g_can_rx_hdr.DLC,
-              g_can_rx_data[0], g_can_rx_data[1], g_can_rx_data[2], g_can_rx_data[3],
-              g_can_rx_data[4], g_can_rx_data[5], g_can_rx_data[6], g_can_rx_data[7]);
-  }
-}
-
-/* USER CODE END CALLBACKS */
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -985,77 +801,145 @@ void StartDefaultTask(void *argument)
   /* USER CODE END 5 */
 }
 
-/* USER CODE BEGIN Header_StartI2CTask */
-/**
-* @brief Function implementing the I2CTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartI2CTask */
-void StartI2CTask(void *argument)
-{
-  /* USER CODE BEGIN StartI2CTask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartI2CTask */
+// --- SPI EEPROM 쓰기 함수 ---
+void EEPROM_WriteEnable(void) {
+  uint8_t cmd = EEPROM_CMD_WREN;
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+  HAL_SPI_Transmit(&hspi1, &cmd, 1, HAL_MAX_DELAY);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
 }
 
-/* USER CODE BEGIN Header_StartSPITask */
-/**
-* @brief Function implementing the SPITask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartSPITask */
-void StartSPITask(void *argument)
-{
-  /* USER CODE BEGIN StartSPITask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartSPITask */
+void EEPROM_WriteDTC(void) {
+  uint8_t cmd[3];
+  EEPROM_WriteEnable();
+  cmd[0] = EEPROM_CMD_WRITE;
+  cmd[1] = (EEPROM_DTC_ADDR >> 8) & 0xFF;
+  cmd[2] = EEPROM_DTC_ADDR & 0xFF;
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+  HAL_SPI_Transmit(&hspi1, cmd, 3, HAL_MAX_DELAY);
+  HAL_SPI_Transmit(&hspi1, (uint8_t*)&DTC_Table, sizeof(DTC_Table), HAL_MAX_DELAY);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
 }
 
-/* USER CODE BEGIN Header_StartCANTask */
-/**
-* @brief Function implementing the CANTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartCANTask */
-void StartCANTask(void *argument)
-{
-  /* USER CODE BEGIN StartCANTask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartCANTask */
+void EEPROM_ReadDTC(void) {
+  uint8_t cmd[3];
+  cmd[0] = EEPROM_CMD_READ;
+  cmd[1] = (EEPROM_DTC_ADDR >> 8) & 0xFF;
+  cmd[2] = EEPROM_DTC_ADDR & 0xFF;
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+  HAL_SPI_Transmit(&hspi1, cmd, 3, HAL_MAX_DELAY);
+  HAL_SPI_Receive(&hspi1, (uint8_t*)&DTC_Table, sizeof(DTC_Table), HAL_MAX_DELAY);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
 }
 
-/* USER CODE BEGIN Header_StartUARTTask */
-/**
-* @brief Function implementing the UARTTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartUARTTask */
-void StartUARTTask(void *argument)
-{
-  /* USER CODE BEGIN StartUARTTask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartUARTTask */
+// --- CAN 수신 인터럽트 콜백 ---
+CAN_RxHeaderTypeDef RxHeader;
+uint8_t RxData[8];
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+  HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData);
+  osMessageQueuePut(CanQueueHandle, RxData, 0, 0);
 }
+
+// --- OBD2/UDS 응답 처리 ---
+void Process_CAN_Response(uint8_t *data) {
+  CAN_TxHeaderTypeDef TxHeader;
+  uint32_t TxMailbox;
+  uint8_t TxData[8] = {0};
+
+  TxHeader.StdId = 0x7E8; // 응답 ID
+  TxHeader.IDE = CAN_ID_STD;
+  TxHeader.RTR = CAN_RTR_DATA;
+  TxHeader.DLC = 8;
+
+  // OBD2 0x43: Read DTCs
+  if (data[1] == 0x43) {
+    if (DTC_Table.active) {
+      TxData[0] = 0x03; TxData[1] = 0x43;
+      TxData[2] = (DTC_Table.DTC_Code >> 8) & 0xFF;
+      TxData[3] = DTC_Table.DTC_Code & 0xFF;
+    } else {
+      TxData[0] = 0x01; TxData[1] = 0x43; TxData[2] = 0x00;
+    }
+  }
+  // OBD2 0x04: Clear DTCs
+  else if (data[1] == 0x04) {
+    DTC_Table.active = 0;
+    EEPROM_WriteDTC();
+    TxData[0] = 0x01; TxData[1] = 0x44; // 응답
+  }
+  // UDS 0x19: Read DTCs
+  else if (data[1] == 0x19) {
+    if (DTC_Table.active) {
+      TxData[0] = 0x03; TxData[1] = 0x59; TxData[2] = 0x02;
+      TxData[3] = (DTC_Table.DTC_Code >> 8) & 0xFF;
+      TxData[4] = DTC_Table.DTC_Code & 0xFF;
+    } else {
+      TxData[0] = 0x01; TxData[1] = 0x59; TxData[2] = 0x00;
+    }
+  }
+  // UDS 0x14: Clear DTCs
+  else if (data[1] == 0x14) {
+    DTC_Table.active = 0;
+    EEPROM_WriteDTC();
+    TxData[0] = 0x02; TxData[1] = 0x54; // 응답
+  }
+  else
+  {
+	/* for misra code*/
+  }
+
+  HAL_CAN_AddTxMessage(&hcan1, &TxHeader, TxData, &TxMailbox);
+}
+/* USER CODE END PFP */
+
+/* USER CODE BEGIN 5 */
+void StartI2CTask(void *argument) {
+  uint8_t faultReg;
+  for(;;) {
+    osMutexAcquire(CommMutexHandleHandle, osWaitForever);
+    HAL_I2C_Mem_Read(&hi2c1, PMIC_I2C_ADDR, PMIC_FAULT_STATUS1_REG, I2C_MEMADD_SIZE_8BIT, &faultReg, 1, HAL_MAX_DELAY);
+    if (faultReg & 0x01) {
+      if (DTC_Table.active == 0) {
+        DTC_Table.active = 1;
+        EEPROM_WriteDTC();
+      }
+    }
+    osMutexRelease(CommMutexHandleHandle);
+    osDelay(500);
+  }
+}
+
+void StartSPITask(void *argument) {
+  for(;;) {
+    osMutexAcquire(CommMutexHandleHandle, osWaitForever);
+    EEPROM_WriteDTC();
+    osMutexRelease(CommMutexHandleHandle);
+    osDelay(5000);
+  }
+}
+
+void StartCANTask(void *argument) {
+  uint8_t rxBuf[8];
+  for(;;) {
+    if (osMessageQueueGet(CanQueueHandle, rxBuf, NULL, osWaitForever) == osOK) {
+      osMutexAcquire(CommMutexHandleHandle, osWaitForever);
+      Process_CAN_Response(rxBuf);
+      osMutexRelease(CommMutexHandleHandle);
+    }
+    osDelay(100);
+  }
+}
+
+void StartUARTTask(void *argument) {
+  const char msg[] = "ECU System Running\r\n";
+  for(;;) {
+    osMutexAcquire(CommMutexHandleHandle, osWaitForever);
+    HAL_UART_Transmit(&huart4, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    osMutexRelease(CommMutexHandleHandle);
+    osDelay(1000);
+  }
+}
+/* USER CODE END 5 */
 
 /**
   * @brief  This function is executed in case of error occurrence.
