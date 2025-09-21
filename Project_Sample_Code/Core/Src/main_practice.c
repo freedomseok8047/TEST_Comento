@@ -732,40 +732,6 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 // }
 
 /**
- * @brief 시스템 초기화 함수
- * @note 모든 하드웨어 초기화를 담당
- */
-void system_init(void) 
-{
-	printf("[INIT] System initialization started ...\n");
-
-	//TODO 하드웨어 초기화
-	  MX_GPIO_Init();
-	  MX_DMA_Init();
-	  MX_ADC1_Init();
-	  MX_CAN1_Init();
-	  MX_I2C1_Init();
-	  MX_I2C2_Init();
-	  MX_SPI1_Init();
-	  MX_SPI2_Init();
-	  MX_UART4_Init();
-
-    // EEPROM 초기화 추가
-    if (eeprom_init() != HAL_OK) {
-      printf("[INIT] ERROR: EEPROM initialization failed!\n");
-      Error_Handler();
-    }
-
-    // CAN Service 초기화 
-    if (!can_service_init(CAN_SPEED_500K)) {
-        printf("[INIT] :ERROR: CAN Service initialization failed!\n");
-        Error_Handler();
-    }
-
-	printf("[INIT] System initialization completed!...\n");
-}
-
-/**
  * @brief I2C 통신 처리 함수 (PMIC 상태 확인)
  * @note MP5475GU와 I2C DMA Interrupt 방식으로 통신
  */
@@ -868,8 +834,17 @@ int main(void)
     HAL_Init();  // HAL 라이브러리 초기화
     SystemClock_Config();  // 시스템 클럭 설정
 
-    //모든 시스템 IC init
-    system_init();
+    // 하드웨어 초기화
+	  MX_GPIO_Init();
+	  MX_DMA_Init();
+	  MX_ADC1_Init();
+	  MX_CAN1_Init();
+	  MX_I2C1_Init();
+	  MX_I2C2_Init();
+	  MX_SPI1_Init();
+	  MX_SPI2_Init();
+	  MX_UART4_Init();
+
 
     // DTC 매니저 초기화 추가
     if (!dtc_manager_init()) {
@@ -895,6 +870,11 @@ int main(void)
         Error_Handler();
     }
     
+    // CAN Service 초기화 
+    if (!can_service_init(CAN_SPEED_500K)) {
+        printf("[INIT] :ERROR: CAN Service initialization failed!\n");
+        Error_Handler();
+    }
 	uint32_t loop_count = 0;
 
 	while(1)

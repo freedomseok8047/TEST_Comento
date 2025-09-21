@@ -10,6 +10,7 @@
 #include "uds_protocol.h"
 #include "eeprom_service.h"
 #include "can_service.h"
+#include "task_manager.h"  // ✅ 새로 추가
 
 // 외부 변수 참조
 extern ADC_HandleTypeDef hadc1;
@@ -17,6 +18,10 @@ extern I2C_HandleTypeDef hi2c1;
 extern SPI_HandleTypeDef hspi1, hspi2;
 extern CAN_HandleTypeDef hcan1;
 extern UART_HandleTypeDef huart4;
+
+// ✅ 새로 추가: Timer 핸들 선언
+TIM_HandleTypeDef htim6;  // 1ms 타이머
+TIM_HandleTypeDef htim7;  // 5ms 타이머
 
 // Init 프로토 타입 선언
 void SystemClock_Config(void);
@@ -29,18 +34,32 @@ static void MX_I2C2_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_UART4_Init(void);
+// ✅ 새로 추가: Timer 초기화 함수
+static void MX_TIM6_Init(void);
+static void MX_TIM7_Init(void);
 
 
-// PMIC IRQ 발생 시 호출되는 콜백
+// // PMIC IRQ 발생 시 호출되는 콜백
+// void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+// {
+// 	if (GPIO_Pin == GPIO_PIN_3) {  // PMIC IRQ 핀
+//         printf("[IRQ] PMIC fault detected, starting diagnosis\n");
+        
+//         // PMIC 서비스를 통해 진단 시작 -> pmic_service.c
+//         if (!pmic_service_start_diagnosis()) {
+//             printf("[WARNING] PMIC diagnosis failed to start\n");
+//         }
+//     }
+// }
+
+// ✅ 수정된 PMIC IRQ 콜백 (플래그만 설정)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
 	if (GPIO_Pin == GPIO_PIN_3) {  // PMIC IRQ 핀
-        printf("[IRQ] PMIC fault detected, starting diagnosis\n");
+        printf("[IRQ] PMIC fault detected, setting flag\n");
         
-        // PMIC 서비스를 통해 진단 시작 -> pmic_service.c
-        if (!pmic_service_start_diagnosis()) {
-            printf("[WARNING] PMIC diagnosis failed to start\n");
-        }
+        // ✅ 즉시 처리 대신 플래그만 설정
+        task_set_pmic_irq_flag();
     }
 }
 
@@ -90,7 +109,6 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
 }
 
 // ========== SPI DMA 송수신 완료 콜백 ==========
-// ✅ 새로운 코드 (간단해짐)
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 {
     if(hspi->Instance == SPI1){
@@ -129,7 +147,9 @@ int main(void)
 	  MX_SPI1_Init();
 	  MX_SPI2_Init();
 	  MX_UART4_Init();
-
+    // ✅ 새로 추가: Timer 초기화
+    MX_TIM6_Init();
+    MX_TIM7_Init();
 
     // DTC 매니저 초기화 추가
     if (!dtc_manager_init()) {
@@ -165,22 +185,62 @@ int main(void)
     dtc_set_can_broadcast_callback(can_service_broadcast_dtc_event);
     printf("[MAIN] DTC-CAN integration completed\n");
 
+    // ✅ 새로 추가: Task 시스템 초기화
+    if (!task_manager_init()) {
+        printf("[MAIN] ERROR: Task Manager initialization failed!\n");
+        Error_Handler();
+    }
+
 	uint32_t loop_count = 0;
 
 	while(1)
 	{
-        // 5초마다 DTC 테스트
-        static uint32_t last_dtc_test = 0;
-        if (HAL_GetTick() - last_dtc_test > 5000) {
-            last_dtc_test = HAL_GetTick();
-            
-            // DTC 추가 → 자동으로 EEPROM 저장 + CAN 전송됨
-            dtc_add_code(0xC001);  
-            printf("[MAIN] DTC 테스트 완료\n");
-        }
+    // ✅ Task Scheduler에서 실행할 작업 확인 및 처리
+    task_scheduler();
 
-		HAL_Delay(10);
+    / 짧은 지연 (CPU 사용률 조절)
+		HAL_Delay(1);
 	}
+}
+
+// ✅ 새로 추가: TIM6 초기화 (1ms 타이머)
+static void MX_TIM6_Init(void)
+{
+    __HAL_RCC_TIM6_CLK_ENABLE();
+    
+    htim6.Instance = TIM6;
+    htim6.Init.Prescaler = 16000 - 1;  // 16MHz / 16000 = 1kHz
+    htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim6.Init.Period = 1 - 1;         // 1ms 주기
+    htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    
+    if (HAL_TIM_Base_Init(&htim6) != HAL_OK) {
+        Error_Handler();
+    }
+    
+    // 인터럽트 설정
+    HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);  // 높은 우선순위
+    HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
+}
+
+// ✅ 새로 추가: TIM7 초기화 (5ms 타이머)
+static void MX_TIM7_Init(void)
+{
+    __HAL_RCC_TIM7_CLK_ENABLE();
+    
+    htim7.Instance = TIM7;
+    htim7.Init.Prescaler = 16000 - 1;  // 16MHz / 16000 = 1kHz
+    htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim7.Init.Period = 5 - 1;         // 5ms 주기
+    htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    
+    if (HAL_TIM_Base_Init(&htim7) != HAL_OK) {
+        Error_Handler();
+    }
+    
+    // 인터럽트 설정
+    HAL_NVIC_SetPriority(TIM7_IRQn, 2, 0);  // 중간 우선순위
+    HAL_NVIC_EnableIRQ(TIM7_IRQn);
 }
 
 /**
@@ -570,12 +630,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  // ✅ TJA1051 S핀 추가 (Silent 제어용)
-    GPIO_InitStruct.Pin = GPIO_PIN_7;  // PB7 (can_service.h에서 정의한 핀)
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct); 
+  // TJA1051 S핀 추가 (Silent 제어용)
+  GPIO_InitStruct.Pin = GPIO_PIN_7;  // PB7 (can_service.h에서 정의한 핀)
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct); 
 
   // NVIC 인터럽트 활성화
   HAL_NVIC_SetPriority(EXTI3_IRQn, 2, 0);

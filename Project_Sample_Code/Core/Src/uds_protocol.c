@@ -75,23 +75,23 @@ bool uds_process_request(const uds_request_t *request, uds_response_t *response)
     bool result = false;
     
     switch (request->service_id) {
-        case UDS_SERVICE_DIAG_SESSION_CTRL:     // 0x10
+        case UDS_SERVICE_DIAG_SESSION_CTRL:     // 0x10 - 진단 세션 시작
             result = uds_service_diagnostic_session_control(request->subfunction, response);
             break;
             
-        case UDS_SERVICE_CLEAR_DTC:             // 0x14
+        case UDS_SERVICE_CLEAR_DTC:             // 0x14 - 모든 DTC 클리어
             result = uds_service_clear_dtc(request->data, response);
             uds_statistics.service_14_count++;
             break;
             
-        case UDS_SERVICE_READ_DTC:              // 0x19
+        case UDS_SERVICE_READ_DTC:              // 0x19 - DTC 목록 조회
             result = uds_service_read_dtc(request->subfunction, 
                                         request->data_length > 0 ? request->data[0] : 0xFF, 
                                         response);
             uds_statistics.service_19_count++;
             break;
             
-        case UDS_SERVICE_READ_DATA:             // 0x22
+        case UDS_SERVICE_READ_DATA:             // 0x22 - 브레이크 상태 데이터
             if (request->data_length >= 2) {
                 uint16_t did = (request->data[0] << 8) | request->data[1];
                 result = uds_service_read_data_by_identifier(did, response);

@@ -110,25 +110,32 @@ bool can_service_init(can_speed_t speed)
 //=============================================================================
 bool can_service_transmit(const can_frame_t *frame)
 {
+    //유효성 검사
     if (!can_initialized || !frame) return false;
     
+    // HAL CAN 구조체로 변환
     CAN_TxHeaderTypeDef tx_header;
     uint32_t tx_mailbox;
     
-    tx_header.StdId = frame->id;
-    tx_header.RTR = frame->rtr ? CAN_RTR_REMOTE : CAN_RTR_DATA;
-    tx_header.IDE = CAN_ID_STD;
-    tx_header.DLC = (frame->dlc > 8) ? 8 : frame->dlc;
+    // CAN 헤더 설정 
+    tx_header.StdId = frame->id;                                    // 0x203
+    tx_header.RTR = frame->rtr ? CAN_RTR_REMOTE : CAN_RTR_DATA;     // CAN_RTR_DATA
+    tx_header.IDE = CAN_ID_STD;                                     // 11비트 표준 ID
+    tx_header.DLC = (frame->dlc > 8) ? 8 : frame->dlc;              // 8
     tx_header.TransmitGlobalTime = DISABLE;
     
+    // HAL 라이브러리로 실제 전송
     HAL_StatusTypeDef result = HAL_CAN_AddTxMessage(&hcan1, &tx_header, 
                                                     (uint8_t*)frame->data, &tx_mailbox);
     
     if (result == HAL_OK) {
         can_status.total_tx_count++;
+        printf("[CAN] DTC transmitted successfully - ID: 0x%03X\n", frame->id);
         return true;
+    } else {
+        printf("[CAN] Transmission failed - Error: %d\n", result);
+        return false;
     }
-    return false;
 }
 
 //=============================================================================
@@ -136,24 +143,66 @@ bool can_service_transmit(const can_frame_t *frame)
 //=============================================================================
 bool can_service_broadcast_dtc_event(uint16_t dtc_code, uint8_t status)
 {
-    can_frame_t frame;
-    frame.id = CAN_ID_BRAKE_DTC;        // 0x203
-    frame.dlc = 8;
-    frame.rtr = false;
+    can_frame_t frame; // CAN 프레임 구조체 생성
+
+    //CAN 프레임 기본 정보 설정 
+    frame.id = CAN_ID_BRAKE_DTC;        // 0x203 (브레이크 DTC ID)
+    frame.dlc = 8;                      // 8바이트 데이터
+    frame.rtr = false;                  // 데이터 프레임 (리모트 프레임 아님)
     
-    // DTC 데이터 패킹
-    frame.data[0] = (dtc_code >> 8) & 0xFF;
-    frame.data[1] = dtc_code & 0xFF;
+    // === 8바이트 CAN 데이터 패킹 (비트/바이트 연산) ===
+    
+    // [0][1] DTC 코드 분할 (16비트 → 2바이트)
+    frame.data[0] = (dtc_code >> 8) & 0xFF; // 상위 8비트
+    frame.data[1] = dtc_code & 0xFF;        // 하위 8비트
+    
+    /*비트 연산 상세:
+    dtc_code = 0xC001 = 1100 0000 0000 0001 (16비트)
+    (0xC001 >> 8) = 0x00C0 = 0000 0000 1100 0000
+    상위 8비트
+    (0x00C0 & 0xFF) = 0xC0 = 1100 0000
+    frame.data[0] = 0xC0
+    하위 8비트
+    (0xC001 & 0xFF) = 0x01 = 0000 0001  
+    frame.data[1] = 0x01*/
+
+    // [2] DTC 상태
     frame.data[2] = status;
-    frame.data[3] = 1;  // 발생횟수
+
+    // [3] 발생횟수 (하드코딩)
+    frame.data[3] = 1;  
     
-    // 타임스탬프
-    uint32_t timestamp = HAL_GetTick();
+    // [4][5][6][7] 타임스탬프 분할 (32비트 → 4바이트)
+    uint32_t timestamp = HAL_GetTick(); // HAL_GetTick() 시스템이 부팅된 후 지난 밀리초
     frame.data[4] = (timestamp >> 24) & 0xFF;
     frame.data[5] = (timestamp >> 16) & 0xFF;
     frame.data[6] = (timestamp >> 8) & 0xFF;
     frame.data[7] = timestamp & 0xFF;
+
+    /*타임스탬프 비트 연산 상세:
+    예시) 25초 = 25000ms
+    timestamp = 25000 = 0x000061A8 = 0000 0000 0000 0000 0110 0001 1010 1000
     
+    (25000 >> 24) & 0xFF:
+    25000 >> 24 = 0x00000000, & 0xFF = 0x00
+    frame.data[4] = 0x00
+    
+    (25000 >> 16) & 0xFF:  
+    25000 >> 16 = 0x00000006, & 0xFF = 0x00
+    frame.data[5] = 0x00
+    
+    (25000 >> 8) & 0xFF:
+    25000 >> 8 = 0x00000061, & 0xFF = 0x61
+    frame.data[6] = 0x61
+    
+    25000 & 0xFF:
+    25000 & 0xFF = 0xA8
+    frame.data[7] = 0xA8
+    
+    데이터: [DTC코드 2(바이트)] [상태 1] [발생횟수 1] [타임스탬프 4]
+    최종 CAN 데이터: [0xC0, 0x01, 0x01, 0x01, 0x00, 0x00, 0x61, 0xA8] */
+    
+    // 실제 CAN 전송 함수 호출
     return can_service_transmit(&frame);
 }
 
