@@ -28,7 +28,8 @@ static DTC_Table_t detected_dtc_table[DTC_MAX_COUNT];
 static uint8_t dtc_count = 0;
 
 // CAN 브로드캐스트 콜백 함수 포인터 (순환 포함 방지)
-static dtc_can_broadcast_func_t can_broadcast_callback = NULL;
+// ❌ 20250930 제거: CAN 브로드캐스트 콜백 함수 포인터 불필요
+// static dtc_can_broadcast_func_t can_broadcast_callback = NULL;
 
 // ========== 내부 함수 선언 ==========
 static bool dtc_find_master_entry(uint16_t dtc_code, const DTC_Table_t** master_entry);
@@ -47,7 +48,8 @@ bool dtc_manager_init(void)
     // detected_dtc_table 초기화
     memset(detected_dtc_table, 0, sizeof(detected_dtc_table));
     dtc_count = 0;
-    can_broadcast_callback = NULL;
+    // ❌ 20250930 제거
+    // can_broadcast_callback = NULL;
     
     printf("[DTC] DTC Manager initialized successfully\n");
     return true;
@@ -56,11 +58,12 @@ bool dtc_manager_init(void)
 /**
  * @brief CAN 브로드캐스트 콜백 함수 설정
  */
-void dtc_set_can_broadcast_callback(dtc_can_broadcast_func_t callback)
-{
-    can_broadcast_callback = callback;
-    printf("[DTC] CAN broadcast callback registered\n");
-}
+// ❌ 20250930 제거 
+// void dtc_set_can_broadcast_callback(dtc_can_broadcast_func_t callback)
+// {
+//     can_broadcast_callback = callback;
+//     printf("[DTC] CAN broadcast callback registered\n");
+// }
 
 /**
  * @brief DTC 추가
@@ -76,32 +79,34 @@ bool dtc_add_code(uint16_t dtc_code)
         printf("[DTC] DTC 0x%04X occurrence count updated: %d\n", 
                dtc_code, detected_dtc_table[existing_index].occurrence_count);
         
+        // 중복 시 → 발생횟수만 증가, EEPROM 업데이트, CAN 재전송
         // EEPROM에 업데이트된 정보 저장
         eeprom_service_save_dtc(dtc_code, detected_dtc_table[existing_index].Description);
         
         // CAN으로 업데이트 전송
-        if (can_broadcast_callback != NULL) {
-            if (!can_broadcast_callback(dtc_code, 1)) {  // 1 = Active
-            printf("[DTC] WARNING: Failed to broadcast DTC via CAN\n");
-        }
+        // ❌ 제거: CAN 재전송 20250930
+        // if (can_broadcast_callback != NULL) {
+        //     if (!can_broadcast_callback(dtc_code, 1)) {  // 1 = Active
+        //     printf("[DTC] WARNING: Failed to broadcast DTC via CAN\n");
+        // }
         
         return true;
     }
 
-    // 2단계: DTC 테이블 공간 확인
+    // 2단계: DTC 테이블 공간 확인 - 포화 시 → 에러 반환, 새 DTC 추가 불가
     if (dtc_count >= DTC_MAX_COUNT) {
         printf("[DTC] ERROR: DTC table full (max: %d)\n", DTC_MAX_COUNT);
         return false;
     }
 
-    // 3단계: 마스터 테이블에서 DTC 정보 찾기
+    // 3단계: 마스터 테이블에서 DTC 정보 찾기 - 입력된 DTC 코드가 유효한지 마스터 테이블에서 확인 - 미등록 코드 시 → 에러 반환
     const DTC_Table_t* master_entry = NULL;
     if (!dtc_find_master_entry(dtc_code, &master_entry)) {
         printf("[DTC] ERROR: Unknown DTC code: 0x%04X\n", dtc_code);
         return false;
     }
 
-    // 4단계: detected_dtc_table에 추가
+    // 4단계: detected_dtc_table에 추가 - 마스터 테이블 정보를 detected_dtc_table에 복사
     dtc_copy_from_master(master_entry, &detected_dtc_table[dtc_count]);
     
     // 새로운 DTC 설정
@@ -114,15 +119,17 @@ bool dtc_add_code(uint16_t dtc_code)
     printf("[DTC] Added: 0x%04X - %s\n", dtc_code, master_entry->Description);
     dtc_count++;
     
-    // 5단계: EEPROM에 자동 저장
+    // 5단계: EEPROM에 자동 저장 - 영구 보존을 위해 SPI DMA로 EEPROM에 비동기 저장
     eeprom_service_save_dtc(dtc_code, master_entry->Description);
     
     // 6단계: CAN으로 DTC 이벤트 브로드캐스트
-    if (can_broadcast_callback != NULL) {
-        if (!can_broadcast_callback(dtc_code, 1)) {  // 1 = Active
-            printf("[DTC] WARNING: Failed to broadcast DTC via CAN\n");
-        }
-    }
+    // ❌ 제거 20250930
+    // if (can_broadcast_callback != NULL) {
+    //         // DTC상태값 1 = Active (새로발생한 DTC) 
+    //     if (!can_broadcast_callback(dtc_code, 1)) {  
+    //         printf("[DTC] WARNING: Failed to broadcast DTC via CAN\n");
+    //     }
+    // }
     
     return true;
 }
@@ -133,12 +140,10 @@ bool dtc_add_code(uint16_t dtc_code)
 bool dtc_clear_all(void)
 {
     printf("[DTC] Clearing all DTCs (UDS Service 0x14)\n");
-    
-    // 클리어 전에 각 DTC의 비활성화를 CAN으로 전송
+   
+    // ✅ 20250930 수정
+    // 클리어만 수행
     for (uint8_t i = 0; i < dtc_count; i++) {
-        if (detected_dtc_table[i].active && can_broadcast_callback != NULL) {
-            can_broadcast_callback(detected_dtc_table[i].DTC_Code, 0);  // 0 = Inactive
-        }
         detected_dtc_table[i].active = 0;
         detected_dtc_table[i].status = DTC_STATUS_INACTIVE;
         printf("[DTC] Cleared: 0x%04X\n", detected_dtc_table[i].DTC_Code);
@@ -164,11 +169,6 @@ bool dtc_clear_specific(uint16_t dtc_code)
     if (index < 0) {
         printf("[DTC] DTC 0x%04X not found for clearing\n", dtc_code);
         return false;
-    }
-    
-    // CAN으로 비활성화 전송
-    if (can_broadcast_callback != NULL) {
-        can_broadcast_callback(dtc_code, 0);  // 0 = Inactive
     }
     
     detected_dtc_table[index].active = 0;

@@ -133,7 +133,7 @@ void task_scheduler(void)
  */
 void task_set_pmic_irq_flag(void)
 {
-    g_task_mgr.pmic_irq_flag = true;
+    g_task_mgr.pmic_irq_flag = true; // MISRA-C pdf 가이드라인 준수: 스팩 찾아 보기
 }
 
 /**
@@ -195,8 +195,8 @@ static void task_5ms_handler(void)
             
             if (fault_count > 0) {
                 printf("[5MS_TASK] PMIC faults detected: %d\n", fault_count);
-                // DTC는 pmic_service_analyze_faults() 내부에서 자동 생성됨
-                // CAN 브로드캐스트도 dtc_add_code() 내부에서 자동 실행됨
+                // DTC는 메모리와 EEPROM에 저장됨
+                // CAN 전송은 외부 UDS 요청 시에만 수행됨
             }
         }
     }

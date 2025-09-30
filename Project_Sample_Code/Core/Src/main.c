@@ -181,22 +181,49 @@ int main(void)
         Error_Handler();
     }
 
-    // 함수 포인터 연결 
-    dtc_set_can_broadcast_callback(can_service_broadcast_dtc_event);
-    printf("[MAIN] DTC-CAN integration completed\n");
+    // 함수 포인터 연결 ❌ 20250930 제거
+    // dtc_set_can_broadcast_callback(can_service_broadcast_dtc_event);
+    // printf("[MAIN] DTC-CAN integration completed\n");
 
     // ✅ 새로 추가: Task 시스템 초기화
     if (!task_manager_init()) {
         printf("[MAIN] ERROR: Task Manager initialization failed!\n");
         Error_Handler();
     }
+    // ✅ 20250930 추가 
+    // EEPROM에서 이전 DTC 복원 (부팅 시 1회)
+    printf("[MAIN] Restoring DTCs from EEPROM...\n");
+    uint16_t stored_dtc_count = eeprom_service_get_dtc_count();
+    
+    if (stored_dtc_count > 0) {
+        printf("[MAIN] Found %d DTCs in EEPROM, restoring to memory\n", stored_dtc_count);
+        
+        // 최대 6개까지 복원
+        uint8_t restore_count = (stored_dtc_count > 6) ? 6 : stored_dtc_count;
+        
+        for (uint8_t i = 0; i < restore_count; i++) {
+            eeprom_dtc_log_t dtc_log;
+            if (eeprom_service_read_dtc(i, &dtc_log)) {
+                // EEPROM에서 읽은 DTC를 메모리에 복원
+                dtc_add_code(dtc_log.DTC_Code);
+                printf("[MAIN] Restored DTC 0x%04X from EEPROM\n", dtc_log.DTC_Code);
+            }
+        }
+        
+        printf("[MAIN] DTC restoration completed: %d DTCs\n", restore_count);
+    } else {
+        printf("[MAIN] No stored DTCs found in EEPROM\n");
+    }
 
-	uint32_t loop_count = 0;
+    uint32_t loop_count = 0;
 
+  // ✅ Task Scheduler에서 실행할 작업 확인 및 처리
+    task_scheduler();
+    
 	while(1)
 	{
-    // ✅ Task Scheduler에서 실행할 작업 확인 및 처리
-    task_scheduler();
+    // // ✅ Task Scheduler에서 실행할 작업 확인 및 처리
+    // task_scheduler();
 
     / 짧은 지연 (CPU 사용률 조절)
 		HAL_Delay(1);

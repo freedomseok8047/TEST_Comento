@@ -104,7 +104,7 @@ bool eeprom_service_save_dtc(uint16_t dtc_code, const char* description)
         return false;
     }
     
-    // DTC 로그 생성하여 큐에 추가
+    // 메모리상 DTC 정보를 EEPROM 저장에 최적화된 64바이트 고정 로그 형식으로 변환 (시간, 발생횟수, 설명 등등)
     convert_dtc_to_log(dtc_code, description, &dtc_save_queue[dtc_queue_count]);
     dtc_queue_count++;
     
@@ -142,6 +142,84 @@ bool eeprom_service_read_dtc(uint8_t index, eeprom_dtc_log_t *dtc_log)
     dtc_log->active = 1;
     
     return true;
+}
+
+/**
+ * @brief EEPROM에서 모든 DTC 읽기 (블로킹 방식)
+ * @note UDS 요청 시 사용 - SPI 블로킹 읽기로 즉시 응답
+ */
+// ✅ 20250930 추가
+uint8_t eeprom_service_read_all_dtc(eeprom_dtc_log_t *dtc_logs, uint8_t max_count)
+{
+    if (dtc_logs == NULL || max_count == 0) {
+        printf("[EEPROM] Invalid parameters for read_all_dtc\n");
+        return 0;
+    }
+    
+    // EEPROM이 바쁘면 대기 (최대 100ms)
+    uint32_t timeout = HAL_GetTick() + 100;
+    while (eeprom_service_state != EEPROM_SERVICE_IDLE && HAL_GetTick() < timeout) {
+        HAL_Delay(1);
+    }
+    
+    if (eeprom_service_state != EEPROM_SERVICE_IDLE) {
+        printf("[EEPROM] Service busy, cannot read DTCs\n");
+        return 0;
+    }
+    
+    // 실제 저장된 DTC 개수 확인
+    uint16_t stored_count = dtc_log_count;
+    if (stored_count == 0) {
+        printf("[EEPROM] No DTCs stored in EEPROM\n");
+        return 0;
+    }
+    
+    // 읽을 개수 결정 (저장된 개수와 요청 개수 중 작은 값)
+    uint8_t read_count = (stored_count < max_count) ? stored_count : max_count;
+    
+    printf("[EEPROM] Reading %d DTCs from EEPROM (blocking mode)\n", read_count);
+    
+    uint8_t success_count = 0;
+    
+    // 각 DTC를 순차적으로 읽기
+    for (uint8_t i = 0; i < read_count; i++) {
+        uint16_t address = LC256_AREA_DTC_CURRENT + (i * sizeof(eeprom_dtc_log_t));
+        
+        // 블로킹 SPI 읽기
+        eeprom_cs_select();
+        
+        // READ 명령어 + 주소
+        uint8_t cmd_buffer[3];
+        cmd_buffer[0] = LC256_CMD_READ;
+        cmd_buffer[1] = (address >> 8) & 0x7F;
+        cmd_buffer[2] = address & 0xFF;
+        
+        // 명령어 전송 (블로킹)
+        if (HAL_SPI_Transmit(eeprom_spi_handle, cmd_buffer, 3, 100) != HAL_OK) {
+            printf("[EEPROM] Failed to send READ command for DTC %d\n", i);
+            eeprom_cs_deselect();
+            break;
+        }
+        
+        // 데이터 수신 (블로킹)
+        uint8_t read_buffer[sizeof(eeprom_dtc_log_t)];
+        if (HAL_SPI_Receive(eeprom_spi_handle, read_buffer, sizeof(eeprom_dtc_log_t), 100) == HAL_OK) {
+            // 데이터 복사
+            memcpy(&dtc_logs[success_count], read_buffer, sizeof(eeprom_dtc_log_t));
+            success_count++;
+        } else {
+            printf("[EEPROM] Failed to read data for DTC %d\n", i);
+        }
+        
+        eeprom_cs_deselect();
+        
+        // 안정성을 위한 짧은 딜레이 (옵션)
+        HAL_Delay(1);
+    }
+    
+    printf("[EEPROM] Successfully read %d/%d DTCs from EEPROM\n", success_count, read_count);
+    
+    return success_count;
 }
 
 /**
@@ -235,9 +313,11 @@ void eeprom_service_tx_complete_callback(void)
             
         case EEPROM_SERVICE_WRITING:
             printf("[EEPROM] Write completed, checking status\n");
-            HAL_Delay(LC256_WRITE_CYCLE_TIME);
+            HAL_Delay(LC256_WRITE_CYCLE_TIME); //쓰기 시간 만큼 딜레이
             
-            if (eeprom_wip_check_internal() != HAL_OK) {
+            //WIP(Write In Progress) 비트확인 쓰기완료여부 판단 
+            // eeprom_wip_check_internal return값 HAL_OK 이면 저장 완료
+            if (eeprom_wip_check_internal() != HAL_OK) { 
                 eeprom_service_state = EEPROM_SERVICE_ERROR;
             }
             break;

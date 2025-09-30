@@ -110,6 +110,15 @@ bool eeprom_service_save_dtc(uint16_t dtc_code, const char* description);
 bool eeprom_service_read_dtc(uint8_t index, eeprom_dtc_log_t *dtc_log);
 
 /**
+ * @brief EEPROM에서 모든 DTC 읽기 (블로킹 방식)
+ * @param dtc_logs DTC 로그 배열 (출력)
+ * @param max_count 최대 읽을 개수
+ * @return 실제 읽은 DTC 개수
+ * @note 블로킹 방식이므로 UDS 요청 처리 시에만 사용
+ */
+uint8_t eeprom_service_read_all_dtc(eeprom_dtc_log_t *dtc_logs, uint8_t max_count);
+
+/**
  * @brief 모든 DTC 클리어
  * @return true: 성공, false: 실패
  */

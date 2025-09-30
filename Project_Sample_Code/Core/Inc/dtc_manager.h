@@ -50,7 +50,8 @@ typedef struct {
 #define DTC_DESCRIPTION_SIZE    50      // 설명 최대 길이
 
 // ========== CAN 브로드캐스트 콜백 함수 타입 ==========
-typedef bool (*dtc_can_broadcast_func_t)(uint16_t dtc_code, uint8_t status);
+// ❌ 20250930제거: 함수 포인터 사용 안함
+// typedef bool (*dtc_can_broadcast_func_t)(uint16_t dtc_code, uint8_t status);
 
 // ========== 전역 함수 선언 ==========
 
@@ -64,7 +65,8 @@ bool dtc_manager_init(void);
  * @brief CAN 브로드캐스트 콜백 함수 설정
  * @param callback CAN 전송 함수 포인터
  */
-void dtc_set_can_broadcast_callback(dtc_can_broadcast_func_t callback);
+// ❌ 20250930제거: 콜백 설정 함수 불필요
+// void dtc_set_can_broadcast_callback(dtc_can_broadcast_func_t callback);
 
 /**
  * @brief DTC 추가
@@ -124,5 +126,3 @@ void dtc_update_status(uint16_t dtc_code, dtc_status_t new_status);
  * @return 생성된 데이터 크기
  */
 uint16_t dtc_create_uds_response(uint8_t* buffer, uint16_t buffer_size);
-
-#endif // DTC_MANAGER_H

@@ -179,7 +179,7 @@ bool can_service_broadcast_dtc_event(uint16_t dtc_code, uint8_t status)
     frame.data[6] = (timestamp >> 8) & 0xFF;
     frame.data[7] = timestamp & 0xFF;
 
-    /*타임스탬프 비트 연산 상세:
+    /* 타임스탬프 비트 연산 상세:
     예시) 25초 = 25000ms
     timestamp = 25000 = 0x000061A8 = 0000 0000 0000 0000 0110 0001 1010 1000
     
@@ -244,6 +244,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
     can_status.total_rx_count++;
 }
 
+
 //=============================================================================
 // UDS 요청 처리 (Single Frame만)
 //=============================================================================
@@ -257,10 +258,11 @@ bool can_service_handle_uds_request(const can_frame_t *frame)
     
     if (pci_type != 0) return false;  // Single Frame만 지원
     
-    // UDS 처리
+    // UDS 요청 파싱
     uds_request_t uds_req;
     if (uds_parse_can_message(&frame->data[1], data_len, &uds_req)) {
         uds_response_t uds_resp;
+        // UDS 프로토콜 모듈로 전달
         if (uds_process_request(&uds_req, &uds_resp)) {
             return can_service_send_uds_response(&uds_resp);
         }

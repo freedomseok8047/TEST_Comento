@@ -197,7 +197,7 @@ uint8_t pmic_service_analyze_faults(const pmic_status_data_t *status_data)
     // ========== 2단계: 우선순위에 따른 DTC 생성 ==========
     uint8_t dtc_count = 0;
     
-    // 높은 우선순위: 온도 셧다운 (가장 위험)
+    // 높은 우선순위 -> 내부정책 : 온도 셧다운 (가장 위험)  if ~ else 
     if (temp_fault) {
         printf("[PMIC] FAULT: High Temperature Shutdown\n");
         if (dtc_add_code(DTC_BRAKE_PMIC_TEMP)) {
@@ -265,7 +265,7 @@ void pmic_service_register_received(uint8_t reg_data)
     // 현재 읽고 있던 레지스터 주소 사용 (내부에서 관리)
     printf("[PMIC] Register received: 0x%02X = 0x%02X\n", pmic_reg_address, reg_data);
     
-    // 레지스터 데이터 처리
+    // 레지스터 데이터 처리 - Union을 사용하여 레지스터별로 데이터 저장
     pmic_process_register_data(pmic_reg_address, reg_data);
     
     // 다음 레지스터로 이동

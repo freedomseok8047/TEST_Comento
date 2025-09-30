@@ -8,8 +8,10 @@
 #include "dtc_manager.h"
 #include "pmic_service.h"
 #include "stm32f4xx_hal.h"  // HAL_GetTick() 사용을 위해 추가
+#include "eeprom_service.h"
 #include <string.h>
 #include <stdio.h>
+
 
 // ========== 내부 변수 ==========
 static uds_state_t uds_current_state = UDS_STATE_IDLE;
@@ -319,29 +321,31 @@ bool uds_service_read_dtc(uint8_t subfunction, uint8_t status_mask, uds_response
             response->subfunction = subfunction;
             response->data[0] = UDS_DTC_STATUS_TEST_FAILED;  // Status Availability Mask
             
-            // DTC 목록 가져오기
-            DTC_Table_t dtc_list[6];
-            uint8_t dtc_count = dtc_get_list(dtc_list, 6);
+            // ❌ 20250930 수정
+            // ✅ EEPROM에서 DTC 읽기
+            eeprom_dtc_log_t eeprom_logs[6];  // 변수 선언 추가!
+            uint8_t dtc_count = eeprom_service_read_all_dtc(eeprom_logs, 6);
             
             uint8_t offset = 1;
             for (uint8_t i = 0; i < dtc_count && offset < (UDS_MAX_MESSAGE_SIZE - 3); i++) {
-                if (dtc_list[i].active) {
+                // ✅ eeprom_dtc_log_t 구조체 사용
+                if (eeprom_logs[i].active) {  // dtc_list → eeprom_logs
                     // UDS DTC 포맷 변환 (3바이트)
-                    uint32_t uds_dtc = uds_convert_brake_dtc_to_uds_format(dtc_list[i].DTC_Code);
+                    uint32_t uds_dtc = uds_convert_brake_dtc_to_uds_format(eeprom_logs[i].DTC_Code);
                     
                     response->data[offset++] = (uds_dtc >> 16) & 0xFF;  // DTC High
                     response->data[offset++] = (uds_dtc >> 8) & 0xFF;   // DTC Mid
                     response->data[offset++] = uds_dtc & 0xFF;          // DTC Low
-                    response->data[offset++] = dtc_list[i].status;      // DTC Status
+                    response->data[offset++] = eeprom_logs[i].status;   // DTC Status
                 }
             }
             
             response->data_length = offset;
             response->is_negative = false;
             
-            printf("[UDS] Reporting %d active DTCs\n", dtc_count);
+            printf("[UDS] Reporting %d active DTCs from EEPROM\n", dtc_count);
             break;
-        }
+    }
         
         default:
             printf("[UDS] Unsupported DTC subfunction: 0x%02X\n", subfunction);
