@@ -11,6 +11,7 @@
 #include "eeprom_service.h"
 #include "can_service.h"
 #include "task_manager.h"  // ✅ 새로 추가
+#include "cmsis_os.h"  // FreeRTOS CMSIS wrapper
 
 // 외부 변수 참조
 extern ADC_HandleTypeDef hadc1;
@@ -18,10 +19,6 @@ extern I2C_HandleTypeDef hi2c1;
 extern SPI_HandleTypeDef hspi1, hspi2;
 extern CAN_HandleTypeDef hcan1;
 extern UART_HandleTypeDef huart4;
-
-// ✅ 새로 추가: Timer 핸들 선언
-TIM_HandleTypeDef htim6;  // 1ms 타이머
-TIM_HandleTypeDef htim7;  // 5ms 타이머
 
 // Init 프로토 타입 선언
 void SystemClock_Config(void);
@@ -34,32 +31,15 @@ static void MX_I2C2_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_UART4_Init(void);
-// ✅ 새로 추가: Timer 초기화 함수
-static void MX_TIM6_Init(void);
-static void MX_TIM7_Init(void);
 
-
-// // PMIC IRQ 발생 시 호출되는 콜백
-// void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-// {
-// 	if (GPIO_Pin == GPIO_PIN_3) {  // PMIC IRQ 핀
-//         printf("[IRQ] PMIC fault detected, starting diagnosis\n");
-        
-//         // PMIC 서비스를 통해 진단 시작 -> pmic_service.c
-//         if (!pmic_service_start_diagnosis()) {
-//             printf("[WARNING] PMIC diagnosis failed to start\n");
-//         }
-//     }
-// }
 
 // ✅ 수정된 PMIC IRQ 콜백 (플래그만 설정)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
 	if (GPIO_Pin == GPIO_PIN_3) {  // PMIC IRQ 핀
-        printf("[IRQ] PMIC fault detected, setting flag\n");
-        
-        // ✅ 즉시 처리 대신 플래그만 설정
-        task_set_pmic_irq_flag();
+        printf("[IRQ] PMIC fault detected\n");
+        // Flag 대신 Event 설정
+        task_set_pmic_irq_event();
     }
 }
 
@@ -132,142 +112,90 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
  */
 int main(void)
 {
-	//시스템 초기화
-    /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-    HAL_Init();  // HAL 라이브러리 초기화
-    SystemClock_Config();  // 시스템 클럭 설정
-
-    // 하드웨어 초기화
-	  MX_GPIO_Init();
-	  MX_DMA_Init();
-	  MX_ADC1_Init();
-	  MX_CAN1_Init();
-	  MX_I2C1_Init();
-	  MX_I2C2_Init();
-	  MX_SPI1_Init();
-	  MX_SPI2_Init();
-	  MX_UART4_Init();
-    // ✅ 새로 추가: Timer 초기화
-    MX_TIM6_Init();
-    MX_TIM7_Init();
-
-    // DTC 매니저 초기화 추가
+    // ========== 시스템 초기화 ==========
+    HAL_Init();
+    SystemClock_Config();
+    
+    // ========== 하드웨어 초기화 ==========
+    MX_GPIO_Init();
+    MX_DMA_Init();
+    MX_ADC1_Init();
+    MX_CAN1_Init();
+    MX_I2C1_Init();
+    MX_I2C2_Init();
+    MX_SPI1_Init();
+    MX_SPI2_Init();
+    MX_UART4_Init();
+    // Timer 초기화 제거 (RTOS가 관리)
+    
+    // ========== 서비스 초기화 ==========
     if (!dtc_manager_init()) {
         printf("[MAIN] ERROR: DTC Manager initialization failed!\n");
         Error_Handler();
     }
 
-    // PMIC 서비스 초기화 추가
     if (!pmic_service_init(&hi2c1)) {
         printf("[MAIN] ERROR: PMIC Service initialization failed!\n");
         Error_Handler();
     }
 
-    // UDS 프로토콜 초기화 추가
     if (!uds_protocol_init()) {
         printf("[MAIN] ERROR: UDS Protocol initialization failed!\n");
         Error_Handler();
     }
     
-    // EEPROM 서비스 초기화 추가
     if (!eeprom_service_init(&hspi1)) {
         printf("[MAIN] ERROR: EEPROM Service initialization failed!\n");
         Error_Handler();
     }
     
-    // CAN Service 초기화 
     if (!can_service_init(CAN_SPEED_500K)) {
-        printf("[INIT] :ERROR: CAN Service initialization failed!\n");
+        printf("[MAIN] ERROR: CAN Service initialization failed!\n");
         Error_Handler();
     }
 
-    // 함수 포인터 연결 ❌ 20250930 제거
-    // dtc_set_can_broadcast_callback(can_service_broadcast_dtc_event);
-    // printf("[MAIN] DTC-CAN integration completed\n");
-
-    // ✅ 새로 추가: Task 시스템 초기화
-    if (!task_manager_init()) {
-        printf("[MAIN] ERROR: Task Manager initialization failed!\n");
-        Error_Handler();
-    }
-    // ✅ 20250930 추가 
-    // EEPROM에서 이전 DTC 복원 (부팅 시 1회)
+    // ========== EEPROM에서 DTC 복원 ==========
     printf("[MAIN] Restoring DTCs from EEPROM...\n");
     uint16_t stored_dtc_count = eeprom_service_get_dtc_count();
     
     if (stored_dtc_count > 0) {
         printf("[MAIN] Found %d DTCs in EEPROM, restoring to memory\n", stored_dtc_count);
-        
-        // 최대 6개까지 복원
         uint8_t restore_count = (stored_dtc_count > 6) ? 6 : stored_dtc_count;
         
         for (uint8_t i = 0; i < restore_count; i++) {
             eeprom_dtc_log_t dtc_log;
             if (eeprom_service_read_dtc(i, &dtc_log)) {
-                // EEPROM에서 읽은 DTC를 메모리에 복원
                 dtc_add_code(dtc_log.DTC_Code);
                 printf("[MAIN] Restored DTC 0x%04X from EEPROM\n", dtc_log.DTC_Code);
             }
         }
-        
         printf("[MAIN] DTC restoration completed: %d DTCs\n", restore_count);
     } else {
         printf("[MAIN] No stored DTCs found in EEPROM\n");
     }
 
-    uint32_t loop_count = 0;
-
-  // ✅ Task Scheduler에서 실행할 작업 확인 및 처리
-    task_scheduler();
-    
-	while(1)
-	{
-    // // ✅ Task Scheduler에서 실행할 작업 확인 및 처리
-    // task_scheduler();
-
-    / 짧은 지연 (CPU 사용률 조절)
-		HAL_Delay(1);
-	}
-}
-
-// ✅ 새로 추가: TIM6 초기화 (1ms 타이머)
-static void MX_TIM6_Init(void)
-{
-    __HAL_RCC_TIM6_CLK_ENABLE();
-    
-    htim6.Instance = TIM6;
-    htim6.Init.Prescaler = 16000 - 1;  // 16MHz / 16000 = 1kHz
-    htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim6.Init.Period = 1 - 1;         // 1ms 주기
-    htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    
-    if (HAL_TIM_Base_Init(&htim6) != HAL_OK) {
+    // ========== Task Manager 초기화 (RTOS 객체 생성) ==========
+    if (!task_manager_init()) {
+        printf("[MAIN] ERROR: Task Manager initialization failed!\n");
         Error_Handler();
     }
     
-    // 인터럽트 설정
-    HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);  // 높은 우선순위
-    HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
-}
-
-// ✅ 새로 추가: TIM7 초기화 (5ms 타이머)
-static void MX_TIM7_Init(void)
-{
-    __HAL_RCC_TIM7_CLK_ENABLE();
-    
-    htim7.Instance = TIM7;
-    htim7.Init.Prescaler = 16000 - 1;  // 16MHz / 16000 = 1kHz
-    htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim7.Init.Period = 5 - 1;         // 5ms 주기
-    htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    
-    if (HAL_TIM_Base_Init(&htim7) != HAL_OK) {
+    // ========== Task 생성 및 시작 ==========
+    if (!task_manager_start()) {
+        printf("[MAIN] ERROR: Task creation failed!\n");
         Error_Handler();
     }
     
-    // 인터럽트 설정
-    HAL_NVIC_SetPriority(TIM7_IRQn, 2, 0);  // 중간 우선순위
-    HAL_NVIC_EnableIRQ(TIM7_IRQn);
+    printf("[MAIN] All systems initialized successfully\n");
+    printf("[MAIN] Starting RTOS scheduler...\n");
+    
+    // ========== RTOS 스케줄러 시작 ==========
+    osKernelStart();
+    
+    // 여기 도달하면 안됨 (스케줄러가 제어권을 가져감)
+    while(1) {
+        // Never reached
+    }
 }
 
 /**

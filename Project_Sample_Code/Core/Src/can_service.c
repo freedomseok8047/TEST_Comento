@@ -15,6 +15,7 @@
 //=============================================================================
 // 전역 변수
 //=============================================================================
+extern osMutexId CAN_MutexHandle;
 extern CAN_HandleTypeDef hcan1;
 static bool can_initialized = false;
 static can_status_t can_status = {0};
@@ -151,7 +152,7 @@ bool can_service_broadcast_dtc_event(uint16_t dtc_code, uint8_t status)
     frame.rtr = false;                  // 데이터 프레임 (리모트 프레임 아님)
     
     // === 8바이트 CAN 데이터 패킹 (비트/바이트 연산) ===
-    
+    //데이터: [DTC코드 2(바이트)] [상태 1] [발생횟수 1] [타임스탬프 4]
     // [0][1] DTC 코드 분할 (16비트 → 2바이트)
     frame.data[0] = (dtc_code >> 8) & 0xFF; // 상위 8비트
     frame.data[1] = dtc_code & 0xFF;        // 하위 8비트

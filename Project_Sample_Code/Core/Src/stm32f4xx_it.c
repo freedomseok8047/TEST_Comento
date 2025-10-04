@@ -113,43 +113,6 @@ void SysTick_Handler(void)
   HAL_IncTick();
 }
 
-/******************************************************************************/
-/* STM32F4xx Peripheral Interrupt Handlers - Task Manager용                   */
-/******************************************************************************/
-
-/**
- * @brief This function handles TIM6 global and DAC1&2 underrun error interrupts.
- * @note 1ms Task Timer 인터럽트 (가장 중요!)
- */
-void TIM6_DAC_IRQHandler(void)
-{
-  // Timer Update 플래그 확인 및 클리어
-  if (__HAL_TIM_GET_FLAG(&htim6, TIM_FLAG_UPDATE) != RESET) {
-    if (__HAL_TIM_GET_IT_SOURCE(&htim6, TIM_IT_UPDATE) != RESET) {
-      __HAL_TIM_CLEAR_IT(&htim6, TIM_IT_UPDATE);
-      
-      // 1ms Task 플래그 설정 (task_manager.c)
-      task_1ms_isr_handler();
-    }
-  }
-}
-
-/**
- * @brief This function handles TIM7 global interrupt.
- * @note 5ms Task Timer 인터럽트
- */
-void TIM7_IRQHandler(void)
-{
-  // Timer Update 플래그 확인 및 클리어
-  if (__HAL_TIM_GET_FLAG(&htim7, TIM_FLAG_UPDATE) != RESET) {
-    if (__HAL_TIM_GET_IT_SOURCE(&htim7, TIM_IT_UPDATE) != RESET) {
-      __HAL_TIM_CLEAR_IT(&htim7, TIM_IT_UPDATE);
-      
-      // 5ms Task 플래그 설정 (task_manager.c)
-      task_5ms_isr_handler();
-    }
-  }
-}
 
 /**
  * @brief This function handles EXTI line3 interrupt.

@@ -205,7 +205,7 @@ uint8_t pmic_service_analyze_faults(const pmic_status_data_t *status_data)
         }
     }
     
-    // 중간 우선순위: 전압/전류 고장
+    // 전압/전류 고장
     if (uv_fault) {
         printf("[PMIC] FAULT: Under Voltage\n");
         if (dtc_add_code(DTC_BRAKE_PMIC_UV)) {

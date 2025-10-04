@@ -11,7 +11,8 @@
 #include <string.h>
 #include <stdio.h>
 
-// ========== 내부 변수 ==========
+//Mutex 추가
+extern osMutexId DTC_MutexHandle;
 
 // DTC 마스터 테이블 (기본 정보)
 static const DTC_Table_t dtc_master_table[DTC_MAX_COUNT] = {
@@ -70,7 +71,7 @@ bool dtc_manager_init(void)
  */
 bool dtc_add_code(uint16_t dtc_code)
 {
-    // 1단계: 중복 DTC 확인
+    // ========== 1단계: 중복 DTC 확인 ==========
     int existing_index = dtc_find_detected_index(dtc_code);
     if (existing_index >= 0) {
         // 이미 존재하는 DTC - 발생 횟수만 증가
@@ -79,34 +80,31 @@ bool dtc_add_code(uint16_t dtc_code)
         printf("[DTC] DTC 0x%04X occurrence count updated: %d\n", 
                dtc_code, detected_dtc_table[existing_index].occurrence_count);
         
-        // 중복 시 → 발생횟수만 증가, EEPROM 업데이트, CAN 재전송
-        // EEPROM에 업데이트된 정보 저장
-        eeprom_service_save_dtc(dtc_code, detected_dtc_table[existing_index].Description);
-        
-        // CAN으로 업데이트 전송
-        // ❌ 제거: CAN 재전송 20250930
-        // if (can_broadcast_callback != NULL) {
-        //     if (!can_broadcast_callback(dtc_code, 1)) {  // 1 = Active
-        //     printf("[DTC] WARNING: Failed to broadcast DTC via CAN\n");
-        // }
+        // ✅ EEPROM 저장 시 Mutex 보호
+        if (osMutexWait(EEPROM_MutexHandle, 100) == osOK) {
+            eeprom_service_save_dtc(dtc_code, detected_dtc_table[existing_index].Description);
+            osMutexRelease(EEPROM_MutexHandle);
+        } else {
+            printf("[DTC] WARNING: Failed to acquire EEPROM mutex\n");
+        }
         
         return true;
     }
 
-    // 2단계: DTC 테이블 공간 확인 - 포화 시 → 에러 반환, 새 DTC 추가 불가
+    // ========== 2단계: DTC 테이블 공간 확인 ==========
     if (dtc_count >= DTC_MAX_COUNT) {
         printf("[DTC] ERROR: DTC table full (max: %d)\n", DTC_MAX_COUNT);
         return false;
     }
 
-    // 3단계: 마스터 테이블에서 DTC 정보 찾기 - 입력된 DTC 코드가 유효한지 마스터 테이블에서 확인 - 미등록 코드 시 → 에러 반환
+    // ========== 3단계: 마스터 테이블에서 DTC 정보 찾기 ==========
     const DTC_Table_t* master_entry = NULL;
     if (!dtc_find_master_entry(dtc_code, &master_entry)) {
         printf("[DTC] ERROR: Unknown DTC code: 0x%04X\n", dtc_code);
         return false;
     }
 
-    // 4단계: detected_dtc_table에 추가 - 마스터 테이블 정보를 detected_dtc_table에 복사
+    // ========== 4단계: detected_dtc_table에 추가 ==========
     dtc_copy_from_master(master_entry, &detected_dtc_table[dtc_count]);
     
     // 새로운 DTC 설정
@@ -119,17 +117,13 @@ bool dtc_add_code(uint16_t dtc_code)
     printf("[DTC] Added: 0x%04X - %s\n", dtc_code, master_entry->Description);
     dtc_count++;
     
-    // 5단계: EEPROM에 자동 저장 - 영구 보존을 위해 SPI DMA로 EEPROM에 비동기 저장
-    eeprom_service_save_dtc(dtc_code, master_entry->Description);
-    
-    // 6단계: CAN으로 DTC 이벤트 브로드캐스트
-    // ❌ 제거 20250930
-    // if (can_broadcast_callback != NULL) {
-    //         // DTC상태값 1 = Active (새로발생한 DTC) 
-    //     if (!can_broadcast_callback(dtc_code, 1)) {  
-    //         printf("[DTC] WARNING: Failed to broadcast DTC via CAN\n");
-    //     }
-    // }
+    // ========== 5단계: EEPROM에 자동 저장 (Mutex 보호) ==========
+    if (osMutexWait(EEPROM_MutexHandle, 100) == osOK) {
+        eeprom_service_save_dtc(dtc_code, master_entry->Description);
+        osMutexRelease(EEPROM_MutexHandle);
+    } else {
+        printf("[DTC] WARNING: Failed to acquire EEPROM mutex for save\n");
+    }
     
     return true;
 }
@@ -153,8 +147,11 @@ bool dtc_clear_all(void)
     memset(detected_dtc_table, 0, sizeof(detected_dtc_table));
     dtc_count = 0;
     
-    // EEPROM에서도 클리어
-    eeprom_service_clear_all_dtc();
+    // ✅ EEPROM 클리어 시 Mutex 보호
+    if (osMutexWait(EEPROM_MutexHandle, 100) == osOK) {
+        eeprom_service_clear_all_dtc();
+        osMutexRelease(EEPROM_MutexHandle);
+    }
     
     printf("[DTC] All DTCs cleared successfully\n");
     return true;

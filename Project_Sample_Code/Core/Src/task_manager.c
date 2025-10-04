@@ -1,8 +1,6 @@
 /**
  * @file task_manager.c
- * @brief Task Manager 구현 - 실제 프로젝트 로직용
- * @author ECU Development Team
- * @date 2025-09-21
+ * @brief Task Manager - RTOS 기반 구현
  */
 
 #include "task_manager.h"
@@ -12,217 +10,250 @@
 #include "dtc_manager.h"
 #include <stdio.h>
 
-/* 외부 핸들 참조 */
-extern TIM_HandleTypeDef htim6;  // 1ms Timer
-extern TIM_HandleTypeDef htim7;  // 5ms Timer
+// ========== RTOS 객체 핸들 ==========
+osThreadId Task1msHandle;
+osThreadId Task5msHandle;
+osThreadId TaskPMICHandle;
+
+osMutexId DTC_MutexHandle;
+osMutexId EEPROM_MutexHandle;
+osMutexId CAN_MutexHandle;
+
+osEventFlagsId SystemEventsHandle;
+
+// ========== 외부 하드웨어 핸들 참조 ==========
 extern ADC_HandleTypeDef hadc1;
 
-/* Task 플래그들 */
-typedef struct {
-    volatile bool pmic_irq_flag;        // PMIC IRQ 발생 플래그
-    volatile bool task_1ms_flag;        // 1ms Task 실행 플래그
-    volatile bool task_5ms_flag;        // 5ms Task 실행 플래그
-    volatile bool emergency_flag;       // 긴급 상황 플래그
-    
-    uint32_t task_1ms_count;            // 1ms Task 실행 횟수
-    uint32_t task_5ms_count;            // 5ms Task 실행 횟수
-    uint32_t pmic_irq_count;            // PMIC IRQ 발생 횟수
-} task_manager_t;
+// ========== Task 함수 선언 (내부 사용) ==========
+static void Task_1ms(void const *argument);
+static void Task_5ms(void const *argument);
+static void Task_PMIC_Monitor(void const *argument);
 
-static task_manager_t g_task_mgr = {0};
-
-/* Forward Declarations */
-static void task_1ms_handler(void);
-static void task_5ms_handler(void);
+// ========== 공개 함수 구현 ==========
 
 /**
  * @brief Task Manager 초기화
  */
 bool task_manager_init(void)
 {
-    printf("[TASK_MGR] Task Manager initialization started\n");
+    printf("[TASK_MGR] Initializing RTOS objects\n");
     
-    // 모든 플래그 초기화
-    g_task_mgr.pmic_irq_flag = false;
-    g_task_mgr.task_1ms_flag = false;
-    g_task_mgr.task_5ms_flag = false;
-    g_task_mgr.emergency_flag = false;
+    // ========== Mutex 생성 ==========
+    osMutexDef(DTC_Mutex);
+    DTC_MutexHandle = osMutexCreate(osMutex(DTC_Mutex));
+    if (DTC_MutexHandle == NULL) {
+        printf("[TASK_MGR] ERROR: Failed to create DTC Mutex\n");
+        return false;
+    }
     
-    g_task_mgr.task_1ms_count = 0;
-    g_task_mgr.task_5ms_count = 0;
-    g_task_mgr.pmic_irq_count = 0;
+    osMutexDef(EEPROM_Mutex);
+    EEPROM_MutexHandle = osMutexCreate(osMutex(EEPROM_Mutex));
+    if (EEPROM_MutexHandle == NULL) {
+        printf("[TASK_MGR] ERROR: Failed to create EEPROM Mutex\n");
+        return false;
+    }
     
-    printf("[TASK_MGR] Task Manager initialization completed\n");
+    osMutexDef(CAN_Mutex);
+    CAN_MutexHandle = osMutexCreate(osMutex(CAN_Mutex));
+    if (CAN_MutexHandle == NULL) {
+        printf("[TASK_MGR] ERROR: Failed to create CAN Mutex\n");
+        return false;
+    }
+    
+    // ========== Event Flags 생성 ==========
+    osEventFlagsDef(SystemEvents);
+    SystemEventsHandle = osEventFlagsCreate(osEventFlags(SystemEvents));
+    if (SystemEventsHandle == NULL) {
+        printf("[TASK_MGR] ERROR: Failed to create Event Flags\n");
+        return false;
+    }
+    
+    printf("[TASK_MGR] RTOS objects created successfully\n");
     return true;
 }
 
 /**
- * @brief Timer 시작
+ * @brief Task 생성 및 시작
  */
-bool task_manager_start_timers(void)
+bool task_manager_start(void)
 {
-    // TIM6 시작 (1ms)
-    if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK) {
-        printf("[TASK_MGR] ERROR: TIM6 start failed\n");
+    printf("[TASK_MGR] Creating tasks\n");
+    
+    // Task 1ms (우선순위: High)
+    osThreadDef(Task1ms, Task_1ms, osPriorityHigh, 0, 256);
+    Task1msHandle = osThreadCreate(osThread(Task1ms), NULL);
+    if (Task1msHandle == NULL) {
+        printf("[TASK_MGR] ERROR: Failed to create Task 1ms\n");
         return false;
     }
     
-    // TIM7 시작 (5ms)
-    if (HAL_TIM_Base_Start_IT(&htim7) != HAL_OK) {
-        printf("[TASK_MGR] ERROR: TIM7 start failed\n");
+    // Task 5ms (우선순위: Normal)
+    osThreadDef(Task5ms, Task_5ms, osPriorityNormal, 0, 512);
+    Task5msHandle = osThreadCreate(osThread(Task5ms), NULL);
+    if (Task5msHandle == NULL) {
+        printf("[TASK_MGR] ERROR: Failed to create Task 5ms\n");
         return false;
     }
     
-    printf("[TASK_MGR] All timers started successfully\n");
+    // Task PMIC Monitor (우선순위: Realtime)
+    osThreadDef(TaskPMIC, Task_PMIC_Monitor, osPriorityRealtime, 0, 256);
+    TaskPMICHandle = osThreadCreate(osThread(TaskPMIC), NULL);
+    if (TaskPMICHandle == NULL) {
+        printf("[TASK_MGR] ERROR: Failed to create PMIC Task\n");
+        return false;
+    }
+    
+    printf("[TASK_MGR] All tasks created successfully\n");
     return true;
 }
 
 /**
- * @brief Timer 정지
+ * @brief PMIC IRQ 이벤트 설정 (ISR에서 호출)
  */
-void task_manager_stop_timers(void)
+void task_set_pmic_irq_event(void)
 {
-    HAL_TIM_Base_Stop_IT(&htim6);
-    HAL_TIM_Base_Stop_IT(&htim7);
-    printf("[TASK_MGR] All timers stopped\n");
+    osEventFlagsSet(SystemEventsHandle, EVENT_PMIC_IRQ);
 }
 
 /**
- * @brief Main Loop Task 스케줄러
+ * @brief Emergency 이벤트 설정
  */
-void task_scheduler(void)
+void task_set_emergency_event(void)
 {
-    // 1. PMIC IRQ 처리 (최고 우선순위)
-    if (g_task_mgr.pmic_irq_flag) {
-        g_task_mgr.pmic_irq_flag = false;
-        g_task_mgr.pmic_irq_count++;
-        
-        printf("[TASK_MGR] Processing PMIC IRQ (Count: %lu)\n", g_task_mgr.pmic_irq_count);
-        
-        // PMIC 진단 시작
-        if (!pmic_service_start_diagnosis()) {
-            printf("[TASK_MGR] WARNING: PMIC diagnosis failed to start\n");
+    osEventFlagsSet(SystemEventsHandle, EVENT_EMERGENCY);
+}
+
+// ========== 내부 Task 함수 구현 ==========
+
+/**
+ * @brief 1ms Task - 빠른 샘플링
+ */
+static void Task_1ms(void const *argument)
+{
+    uint32_t tick_count = 0;
+    
+    printf("[TASK_1MS] Started\n");
+    
+    for(;;)
+    {
+        // 1. ADC 빠른 샘플링
+        if (HAL_ADC_Start(&hadc1) == HAL_OK) {
+            if (HAL_ADC_PollForConversion(&hadc1, 1) == HAL_OK) {
+                uint32_t adc_value = HAL_ADC_GetValue(&hadc1);
+                
+                // 위험 전압 감지
+                if (adc_value < 1000 || adc_value > 4000) {
+                    task_set_emergency_event();
+                }
+            }
+            HAL_ADC_Stop(&hadc1);
         }
-    }
-    
-    // 2. 1ms Task 처리
-    if (g_task_mgr.task_1ms_flag) {
-        g_task_mgr.task_1ms_flag = false;
-        g_task_mgr.task_1ms_count++;
-        task_1ms_handler();
-    }
-    
-    // 3. 5ms Task 처리
-    if (g_task_mgr.task_5ms_flag) {
-        g_task_mgr.task_5ms_flag = false;
-        g_task_mgr.task_5ms_count++;
-        task_5ms_handler();
-    }
-    
-    // 4. 긴급 상황 처리
-    if (g_task_mgr.emergency_flag) {
-        g_task_mgr.emergency_flag = false;
         
-        printf("[TASK_MGR] Processing emergency situation\n");
-        dtc_add_code(DTC_BRAKE_SYSTEM_FAULT);
+        // 2. PMIC IRQ 핀 직접 체크
+        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_3) == GPIO_PIN_RESET) {
+            task_set_pmic_irq_event();
+        }
+        
+        // 3. 1초마다 상태 출력
+        tick_count++;
+        if ((tick_count % 1000) == 0) {
+            printf("[TASK_1MS] Count: %lu\n", tick_count);
+        }
+        
+        osDelay(1);  // 1ms 대기
     }
 }
 
 /**
- * @brief PMIC IRQ 플래그 설정 (GPIO EXTI에서 호출)
+ * @brief 5ms Task - 주기적 작업
  */
-void task_set_pmic_irq_flag(void)
+static void Task_5ms(void const *argument)
 {
-    g_task_mgr.pmic_irq_flag = true; // MISRA-C pdf 가이드라인 준수: 스팩 찾아 보기
-}
-
-/**
- * @brief 1ms Timer ISR 핸들러 (TIM6에서 호출)
- */
-void task_1ms_isr_handler(void)
-{
-    g_task_mgr.task_1ms_flag = true;
-}
-
-/**
- * @brief 5ms Timer ISR 핸들러 (TIM7에서 호출)
- */
-void task_5ms_isr_handler(void)
-{
-    g_task_mgr.task_5ms_flag = true;
-}
-
-/**
- * @brief 1ms Task 실제 처리 함수 - 빠른 감지만
- */
-static void task_1ms_handler(void)
-{
-    // 1. ADC 빠른 샘플링 (전압 감시)
-    if (HAL_ADC_Start(&hadc1) == HAL_OK) {
-        if (HAL_ADC_PollForConversion(&hadc1, 1) == HAL_OK) {
-            uint32_t adc_value = HAL_ADC_GetValue(&hadc1);
-            
-            // 위험 전압 감지 시 긴급 플래그 설정
-            if (adc_value < 1000 || adc_value > 4000) {
-                g_task_mgr.emergency_flag = true;
+    uint32_t tick_count = 0;
+    
+    printf("[TASK_5MS] Started\n");
+    
+    for(;;)
+    {
+        tick_count++;
+        
+        // 1. PMIC 진단 결과 확인
+        if (pmic_service_get_state() == PMIC_SERVICE_COMPLETE) {
+            pmic_status_data_t pmic_data;
+            if (pmic_service_get_status(&pmic_data)) {
+                // DTC 분석 (Mutex 보호)
+                osMutexWait(DTC_MutexHandle, osWaitForever);
+                uint8_t fault_count = pmic_service_analyze_faults(&pmic_data);
+                osMutexRelease(DTC_MutexHandle);
+                
+                if (fault_count > 0) {
+                    printf("[TASK_5MS] PMIC faults: %d\n", fault_count);
+                }
             }
         }
-        HAL_ADC_Stop(&hadc1);
-    }
-    
-    // 2. PMIC IRQ 핀 직접 체크 (추가 안전장치)
-    if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_3) == GPIO_PIN_RESET) {
-        g_task_mgr.pmic_irq_flag = true;
-    }
-    
-    // 3. 1초마다 상태 출력
-    if ((g_task_mgr.task_1ms_count % 1000) == 0) {
-        printf("[1MS_TASK] Running - Count: %lu\n", g_task_mgr.task_1ms_count);
+        
+        // 2. CAN 주기 전송 (100ms: 5ms * 20)
+        if ((tick_count % 20) == 0) {
+            brake_can_data_t brake_status = {0};
+            brake_status.status.system_status = 0x01;
+            
+            osMutexWait(DTC_MutexHandle, osWaitForever);
+            brake_status.status.active_dtc_count = dtc_get_active_count();
+            osMutexRelease(DTC_MutexHandle);
+            
+            brake_status.status.brake_pressure = 850;
+            brake_status.status.temperature = 65;
+            brake_status.status.power_mode = 0x01;
+            
+            osMutexWait(CAN_MutexHandle, osWaitForever);
+            can_service_send_brake_status(&brake_status);
+            osMutexRelease(CAN_MutexHandle);
+        }
+        
+        // 3. 시스템 상태 (1초: 5ms * 200)
+        if ((tick_count % 200) == 0) {
+            osMutexWait(DTC_MutexHandle, osWaitForever);
+            uint8_t dtc_count = dtc_get_active_count();
+            osMutexRelease(DTC_MutexHandle);
+            
+            printf("[TASK_5MS] DTCs: %d\n", dtc_count);
+        }
+        
+        osDelay(5);  // 5ms 대기
     }
 }
 
 /**
- * @brief 5ms Task 실제 처리 함수 - 실제 작업 수행
+ * @brief PMIC Monitor Task - 이벤트 대기
  */
-static void task_5ms_handler(void)
+static void Task_PMIC_Monitor(void const *argument)
 {
-    // 1. PMIC 진단 결과 확인 및 처리
-    if (pmic_service_get_state() == PMIC_SERVICE_COMPLETE) {
-        pmic_status_data_t pmic_data;
-        if (pmic_service_get_status(&pmic_data)) {
-            // PMIC 고장 분석 수행
-            uint8_t fault_count = pmic_service_analyze_faults(&pmic_data);
+    printf("[TASK_PMIC] Started\n");
+    
+    for(;;)
+    {
+        // 이벤트 대기
+        uint32_t flags = osEventFlagsWait(SystemEventsHandle,
+                                          EVENT_PMIC_IRQ | EVENT_EMERGENCY,
+                                          osFlagsWaitAny,
+                                          osWaitForever);
+        
+        // PMIC IRQ 처리
+        if (flags & EVENT_PMIC_IRQ) {
+            printf("[TASK_PMIC] IRQ detected\n");
             
-            if (fault_count > 0) {
-                printf("[5MS_TASK] PMIC faults detected: %d\n", fault_count);
-                // DTC는 메모리와 EEPROM에 저장됨
-                // CAN 전송은 외부 UDS 요청 시에만 수행됨
+            if (!pmic_service_start_diagnosis()) {
+                printf("[TASK_PMIC] WARNING: Diagnosis failed\n");
             }
         }
-    }
-    
-    // 2. EEPROM 주기적 백업 (10초마다: 5ms * 2000 = 10초)
-    if ((g_task_mgr.task_5ms_count % 2000) == 0) {
-        printf("[5MS_TASK] Performing periodic EEPROM backup\n");
-        // EEPROM 백업은 DTC가 생성될 때 자동으로 수행됨
-    }
-    
-    // 3. CAN 주기적 메시지 전송 (100ms마다: 5ms * 20 = 100ms)
-    if ((g_task_mgr.task_5ms_count % 20) == 0) {
-        // 브레이크 시스템 상태 주기 전송
-        brake_can_data_t brake_status = {0};
-        brake_status.status.system_status = 0x01;  // Normal
-        brake_status.status.active_dtc_count = dtc_get_active_count();
-        brake_status.status.brake_pressure = 850;  // kPa
-        brake_status.status.temperature = 65;      // 도씨
-        brake_status.status.power_mode = 0x01;     // Normal
         
-        can_service_send_brake_status(&brake_status);
-    }
-    
-    // 4. 시스템 상태 체크 (1초마다: 5ms * 200 = 1초)
-    if ((g_task_mgr.task_5ms_count % 200) == 0) {
-        printf("[5MS_TASK] System check - DTCs: %d, PMIC IRQs: %lu\n", 
-               dtc_get_active_count(), g_task_mgr.pmic_irq_count);
+        // 긴급 상황 처리
+        if (flags & EVENT_EMERGENCY) {
+            printf("[TASK_PMIC] Emergency!\n");
+            
+            osMutexWait(DTC_MutexHandle, osWaitForever);
+            dtc_add_code(DTC_BRAKE_SYSTEM_FAULT);
+            osMutexRelease(DTC_MutexHandle);
+        }
     }
 }
